@@ -456,7 +456,13 @@ Add SplatGUT method configurations.
 Append this to the existing method_configs.py file.
 """
 
-# ==================== SplatGUT Configurations ====================
+# ============================================================================
+# SplatGUT: SplatAD with 3DGUT Ray Tracing
+# ============================================================================
+
+# ============================================================================
+# SplatGUT: SplatAD with 3DGUT Ray Tracing
+# ============================================================================
 
 method_configs["splatgut"] = TrainerConfig(
     method_name="splatgut",
@@ -466,93 +472,31 @@ method_configs["splatgut"] = TrainerConfig(
     steps_per_eval_all_images=2500,
     max_num_iterations=30001,
     mixed_precision=False,
-    pipeline=SplatADPipelineConfig(  # Reuse SplatAD pipeline!
-        calc_fid_steps=(30000,),
-        datamanager=FullImageLidarDatamanagerConfig(
-            dataparser=PandaSetDataParserConfig(add_missing_points=True),
-            cache_images_type="uint8",
-        ),
-        model=SplatGUTModelConfig(  # New model
-            use_gut_projection=True,
-            use_ray_tracing=False,  # Fast mode
-            gut_alpha=1.0,
-            gut_beta=0.0,
-            gut_kappa=0.0,
-            enable_fallback=True,
-            # All SplatAD parameters inherited:
-            warmup_length=500,
-            refine_every=100,
-            strategy="mcmc",
-            cull_alpha_thresh=0.005,
-            max_steps=30001,
-        ),
-    ),
-    optimizers={
-        "means": {
-            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=1.6e-6,
-                max_steps=30000,
-            ),
-        },
-        "features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-            "scheduler": None,
-        },
-        "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
-            "scheduler": None,
-        },
-        "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
-            "scheduler": None,
-        },
-        "scales": {
-            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
-            "scheduler": None,
-        },
-        "quats": {
-            "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
-            "scheduler": None,
-        },
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
-        },
-        "camera_vel_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
-
-
-method_configs["splatgut-rt"] = TrainerConfig(
-    method_name="splatgut-rt",
-    steps_per_eval_image=500,
-    steps_per_eval_batch=0,
-    steps_per_save=2000,
-    steps_per_eval_all_images=2500,
-    max_num_iterations=30001,
-    mixed_precision=False,
+    
     pipeline=SplatADPipelineConfig(
         calc_fid_steps=(30000,),
         datamanager=FullImageLidarDatamanagerConfig(
             dataparser=PandaSetDataParserConfig(add_missing_points=True),
             cache_images_type="uint8",
         ),
+        
         model=SplatGUTModelConfig(
-            use_gut_projection=True,
-            use_ray_tracing=True,  # Ray tracing mode (slower, higher quality)
-            gut_alpha=1.0,
-            enable_fallback=False,  # Require 3DGUT
+            # ========== 3DGUT 专属参数 ==========
+            use_ray_tracing=True,
+            camera_model="pinhole",
+            fisheye_distortion=None,
+            k_buffer_size=32,
+            ut_alpha=1.0,
+            ut_beta=0.0,
+            
+            # ========== SplatAD 参数 (继承) ==========
             max_steps=30001,
+            # 其他参数用默认值
         ),
     ),
+    
+    # 完整复制SplatAD的optimizers (确保所有参数组都有)
     optimizers={
-        # Same as splatgut
         "means": {
             "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
@@ -565,7 +509,7 @@ method_configs["splatgut-rt"] = TrainerConfig(
             "scheduler": None,
         },
         "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),  # 注意:不除以20
             "scheduler": None,
         },
         "opacities": {
@@ -581,78 +525,37 @@ method_configs["splatgut-rt"] = TrainerConfig(
             "scheduler": None,
         },
         "camera_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
+            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-7, max_steps=30000),
         },
-        "camera_vel_opt": {
+        "camera_velocity_opt_linear": {
             "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
-        },
-    },
-    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
-    vis="viewer",
-)
-
-
-method_configs["splatgut-ewa"] = TrainerConfig(
-    method_name="splatgut-ewa",
-    steps_per_eval_image=500,
-    steps_per_eval_batch=0,
-    steps_per_save=2000,
-    steps_per_eval_all_images=2500,
-    max_num_iterations=30001,
-    mixed_precision=False,
-    pipeline=SplatADPipelineConfig(
-        calc_fid_steps=(30000,),
-        datamanager=FullImageLidarDatamanagerConfig(
-            dataparser=PandaSetDataParserConfig(add_missing_points=True),
-            cache_images_type="uint8",
-        ),
-        model=SplatGUTModelConfig(
-            use_gut_projection=False,  # Explicitly use EWA (baseline comparison)
-            use_ray_tracing=False,
-            enable_fallback=True,
-            max_steps=30001,
-        ),
-    ),
-    optimizers={
-        # Same as splatgut
-        "means": {
-            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=1.6e-6,
-                max_steps=30000,
+                lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
             ),
         },
-        "features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
-            "scheduler": None,
+        "camera_velocity_opt_angular": {
+            "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=1e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+            ),
         },
-        "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
-            "scheduler": None,
+        "camera_velocity_opt_time_to_center_pixel": {
+            "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=1e-7, max_steps=30000, warmup_steps=10000, lr_pre_warmup=0
+            ),
         },
-        "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
-            "scheduler": None,
-        },
-        "scales": {
-            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
-            "scheduler": None,
-        },
-        "quats": {
-            "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
-            "scheduler": None,
-        },
-        "camera_opt": {
+        "trajectory_opt": {
             "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
         },
-        "camera_vel_opt": {
-            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
+        "fields": {
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
         },
     },
+    
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
 )

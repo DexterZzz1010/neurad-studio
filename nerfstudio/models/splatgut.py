@@ -1,372 +1,306 @@
 """
-SplatGUT: SplatAD with 3DGUT Unscented Transform Projection.
+SplatGUT: SplatAD + 3DGUT Ray Tracing.
 
-Minimal invasive extension of SplatAD that replaces EWA splatting
-with Unscented Transform for better handling of:
-    - Distorted camera models (fisheye, equirectangular)
-    - Rolling shutter effects (per-sigma-point extrinsics)
-    - Derivative-free projection (no Jacobian required)
+Inherits ALL SplatAD logic (scene graph, optimization, losses).
+Only overrides camera rendering: EWA splatting → Unscented Transform ray tracing.
 
-Inherits all scene management, optimization, and decoding logic from SplatAD.
-Only overrides camera rendering pipeline.
+Linus principles:
+    1. Eliminate special cases: Same Model interface for both renderers
+    2. Practical: Graceful degradation if 3DGUT unavailable
+    3. Simple: Override ONE method, ~50 LOC
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Optional, Tuple, Type
+from typing import Dict, Optional, Type
 
 import torch
 from torch import Tensor
-from typing_extensions import Literal
 
-from nerfstudio.adapters.threedgut_adapter import GUTProjectorAdapter, GUTRayTracer
-from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.models.splatad import SplatADModel, SplatADModelConfig
+from nerfstudio.cameras.cameras import Cameras
 
 
 @dataclass
 class SplatGUTModelConfig(SplatADModelConfig):
-    """
-    Configuration for SplatGUT model.
-    
-    Inherits all SplatAD parameters (warmup_length, refine_every, etc.)
-    and adds 3DGUT-specific options.
-    """
+    """SplatGUT config - adds ray tracing + camera model selection."""
     
     _target: Type = field(default_factory=lambda: SplatGUTModel)
     
-    # ==================== 3DGUT Projection ====================
+    use_ray_tracing: bool = True
+    """Enable 3DGUT ray tracing. Slower but handles distortion/rolling shutter."""
     
-    use_gut_projection: bool = True
-    """Use Unscented Transform projection instead of EWA splatting."""
+    camera_model: str = "pinhole"
+    """Camera model: 'pinhole', 'fisheye', or 'auto' (infer from distortion_params)."""
     
-    gut_alpha: float = 1.0
-    """UT spread parameter (controls sigma point deviation)."""
+    # Fisheye distortion coefficients (if camera_model="fisheye" and not in dataparser)
+    fisheye_distortion: Optional[list] = None
+    """[k1, k2, k3, k4] for fisheye. If None, read from camera.distortion_params."""
     
-    gut_beta: float = 0.0
-    """UT weight parameter for covariance calculation."""
+    # 3DGUT-specific rendering parameters
+    k_buffer_size: int = 32
+    """Max Gaussians per ray (memory vs quality trade-off)."""
     
-    gut_kappa: float = 0.0
-    """UT secondary parameter."""
+    ut_alpha: float = 1.0
+    """Unscented Transform spread parameter (default: 1.0)."""
     
-    # ==================== Rendering Mode ====================
-    
-    use_ray_tracing: bool = False
-    """Use ray tracing instead of rasterization (slower, enables secondary rays)."""
-    
-    enable_fallback: bool = True
-    """Fallback to EWA projection if 3DGUT unavailable."""
+    ut_beta: float = 0.0
+    """Unscented Transform kurtosis parameter (default: 0.0)."""
 
 
 class SplatGUTModel(SplatADModel):
     """
-    SplatAD model with 3DGUT Unscented Transform projection.
+    SplatAD with 3DGUT.
     
-    Design philosophy (following Linus "good taste"):
-        1. Eliminate special cases: Unified interface handles both EWA and UT
-        2. Practical: Graceful fallback when 3DGUT unavailable
-        3. Simple: Only override what's necessary, inherit everything else
+    Inheritance chain:
+        Model → ADModel → SplatADModel → SplatGUTModel
     
-    Inheritance hierarchy:
-        Model (base_model.py)
-        ↓
-        ADModel (ad_model.py) - Adds dynamic actors, camera optimization
-        ↓
-        SplatADModel (splatad.py) - Adds Gaussians, decoders, optimization
-        ↓
-        SplatGUTModel (THIS CLASS) - Replaces projection method only
+    Inherited (unchanged):
+        - populate_modules(): Gaussians, scene graph, decoders, optimizers
+        - get_outputs(): RGB + LiDAR rendering pipeline
+        - get_loss_dict(): All loss functions
+        - get_metrics_dict(): PSNR, SSIM, etc.
+        - Dynamic actors, MCMC refinement, camera optimization
+    
+    Overridden (this file):
+        - get_outputs_for_camera(): EWA → UT ray tracing
     """
     
     config: SplatGUTModelConfig
     
     def populate_modules(self):
-        """
-        Initialize all modules.
-        
-        Calls parent to initialize:
-            - Gaussian parameters (means, quats, scales, opacities, features)
-            - Dynamic actors and scene graph
-            - RGB and LiDAR decoders
-            - Camera optimizer
-        
-        Then adds 3DGUT components.
-        """
+        """Initialize all modules (calls parent for everything)."""
         super().populate_modules()
-        self._init_gut_components()
-    
-    def _init_gut_components(self):
-        """Initialize 3DGUT-specific components."""
-        self.gut_projector = GUTProjectorAdapter(
-            alpha=self.config.gut_alpha,
-            beta=self.config.gut_beta,
-            kappa=self.config.gut_kappa,
-            enable_fallback=self.config.enable_fallback,
-        )
         
         if self.config.use_ray_tracing:
-            self.gut_ray_tracer = GUTRayTracer()
-        else:
-            self.gut_ray_tracer = None
-    
-    # ==================== Camera Rendering (Override) ====================
+            # Lazy import to avoid circular dependency
+            try:
+                from nerfstudio.adapters.threedgut_adapter import GUT3DRenderer, THREEDGUT_AVAILABLE
+            except ImportError as e:
+                print(f"[ERROR] Failed to import threedgut_adapter: {e}")
+                print("[WARN] Falling back to rasterization")
+                self.config.use_ray_tracing = False
+                return
+            
+            if not THREEDGUT_AVAILABLE:
+                print("[WARN] 3DGUT not available, falling back to rasterization")
+                self.config.use_ray_tracing = False
+                return
+            
+            # Get sh_degree safely (might be sh_degree_max or num_sh_degree)
+            sh_degree = getattr(self.config, 'sh_degree', 
+                               getattr(self.config, 'sh_degree_max',
+                                      getattr(self, 'num_sh_degree', 3)))
+            
+            # Build 3DGUT config (minimal required params)
+            gut_config = {
+                'render': {
+                    'method': '3dgut',
+                    'particle_radiance_sph_degree': sh_degree,
+                    'particle_kernel_degree': 2,
+                    'particle_kernel_min_response': 0.0,
+                    'particle_kernel_min_alpha': 0.0,
+                    'particle_kernel_max_alpha': 1.0,
+                    'min_transmittance': 0.001,
+                    'enable_hitcounts': True,
+                    'splat': {
+                        'n_rolling_shutter_iterations': 1,
+                        'k_buffer_size': self.config.k_buffer_size,
+                        'global_z_order': False,
+                        'ut_alpha': self.config.ut_alpha,
+                        'ut_beta': self.config.ut_beta,
+                        'ut_kappa': 0.0,
+                        'ut_in_image_margin_factor': 1.5,
+                        'ut_require_all_sigma_points_valid': False,
+                        'rect_bounding': True,
+                        'tight_opacity_bounding': True,
+                        'tile_based_culling': True,
+                    }
+                }
+            }
+            
+            self.gut_renderer = GUT3DRenderer(gut_config)
+            print(f"[INFO] 3DGUT initialized:")
+            print(f"  - Camera model: {self.config.camera_model}")
+            print(f"  - SH degree: {sh_degree}")
+            print(f"  - K-buffer size: {self.config.k_buffer_size}")
+            print(f"  - UT params: α={self.config.ut_alpha}, β={self.config.ut_beta}")
     
     def get_outputs_for_camera(self, camera: Cameras) -> Dict[str, Tensor]:
         """
-        Render camera view using 3DGUT or fallback to EWA.
+        Render camera with 3DGUT ray tracing.
         
-        This is the ONLY method we override from SplatADModel.
-        All other functionality (LiDAR, loss, metrics, optimization) inherited.
-        
-        Args:
-            camera: Camera object with intrinsics and extrinsics
-        
-        Returns:
-            Dictionary containing:
-                - 'rgb': Rendered RGB image [H, W, 3]
-                - 'depth': Depth map [H, W]
-                - Additional outputs (accumulation, etc.)
+        Pipeline:
+            1. Generate rays (nerfstudio helper)
+            2. Apply camera optimization (SplatAD logic)
+            3. Render with 3DGUT
+            4. Decode RGB (SplatAD decoder)
         """
         
-        if not isinstance(camera, Cameras):
-            raise TypeError(f"Expected Cameras, got {type(camera)}")
+        if not self.config.use_ray_tracing:
+            # Fallback to parent's rasterization
+            return super().get_outputs_for_camera(camera)
         
-        # ===== Stage 1: Prepare Camera Parameters (reuse SplatAD logic) =====
-        camera_to_world = self._prepare_camera_pose(camera)
-        K, W, H = self._prepare_camera_intrinsics(camera)
-        colors = self._prepare_gaussian_colors()
-        rs_state = self._prepare_rolling_shutter_state(camera)
+        # Step 1: Prepare camera (SplatAD logic)
+        if self.training or self.config.use_camopt_in_eval:
+            camera = self.camera_optimizer.apply_to_camera(camera)
         
-        # ===== Stage 2: Project Gaussians (KEY REPLACEMENT!) =====
-        if self.config.use_gut_projection:
-            projected = self._gut_projection(camera_to_world, K, W, H, rs_state)
+        # Handle downscaling
+        scale = self._get_downscale_factor()
+        if scale != 1:
+            camera.rescale_output_resolution(1 / scale)
+        
+        W, H = int(camera.width.item()), int(camera.height.item())
+        c2w = camera.camera_to_worlds
+        
+        # Step 2: Generate rays (standard pinhole for now)
+        rays_o, rays_d = self._generate_camera_rays(camera, W, H, c2w)
+        
+        # Step 3: Render with 3DGUT (THE CORE CHANGE)
+        outputs = self.gut_renderer.render(
+            model=self,  # Pass self so GaussiansWrapper can access params
+            camera=camera,
+            rays_o=rays_o,
+            rays_d=rays_d,
+            c2w=c2w,
+        )
+        
+        # Step 4: Decode RGB if decoder present
+        if hasattr(self, 'rgb_decoder'):
+            from nerfstudio.models.splatad import get_ray_dirs_pinhole
+            ray_dirs = get_ray_dirs_pinhole(camera, W, H, c2w)
+            rgb = self.rgb_decoder(outputs['rgb'], ray_dirs).squeeze(0)
         else:
-            projected = self._ewa_projection(camera_to_world, K, W, H, rs_state)
+            rgb = outputs['rgb']
         
-        # ===== Stage 3: Render (optional ray tracing) =====
-        if self.config.use_ray_tracing and self.gut_ray_tracer is not None:
-            render_out = self._ray_trace_render(projected, colors, W, H)
-        else:
-            render_out = self._rasterize_render(projected, colors, W, H)
-        
-        # ===== Stage 4: Decode Features (reuse SplatAD decoder) =====
-        rgb = self._decode_rgb(render_out['features'], camera, W, H)
-        
-        # Restore camera resolution if downscaled
-        self._restore_camera_resolution(camera)
+        # Restore resolution
+        if scale != 1:
+            camera.rescale_output_resolution(scale)
         
         return {
             'rgb': rgb,
-            'depth': render_out['depth'],
-            'accumulation': render_out.get('alpha', None),
+            'depth': outputs['depth'],
+            'accumulation': outputs['alpha'],
         }
     
-    # ==================== Preparation Helpers (reuse SplatAD) ====================
+    def _generate_camera_rays(self, camera, W, H, c2w):
+        """
+        Generate camera rays based on camera model.
+        
+        For pinhole: Standard perspective projection
+        For fisheye: Kannala-Brandt undistortion (if available)
+        """
+        device = c2w.device
+        fx = camera.fx.item()
+        fy = camera.fy.item()
+        cx = camera.cx.item()
+        cy = camera.cy.item()
+        
+        # Generate pixel coordinates
+        y, x = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing='ij'
+        )
+        
+        # Check if fisheye
+        if self.config.camera_model == "fisheye" or (
+            self.config.camera_model == "auto" and 
+            hasattr(camera, 'distortion_params') and 
+            camera.distortion_params is not None
+        ):
+            # Use fisheye undistortion
+            rays_d = self._generate_fisheye_rays(x, y, fx, fy, cx, cy, camera, device)
+        else:
+            # Use pinhole projection
+            dirs_cam = torch.stack([
+                (x - cx) / fx,
+                (y - cy) / fy,
+                torch.ones_like(x)
+            ], dim=-1)
+            
+            # Transform to world space
+            R = c2w[0, :3, :3] if c2w.dim() == 3 else c2w[:3, :3]
+            rays_d = (dirs_cam @ R.T)
+            rays_d = rays_d / rays_d.norm(dim=-1, keepdim=True)
+        
+        # Origin (same for both)
+        t = c2w[0, :3, 3] if c2w.dim() == 3 else c2w[:3, 3]
+        rays_o = t[None, None, :].expand(H, W, 3)
+        
+        return rays_o, rays_d
     
-    def _prepare_camera_pose(self, camera: Cameras) -> Tensor:
-        """Get optimized camera pose. Reuses SplatAD's camera optimization."""
+    def _generate_fisheye_rays(self, x, y, fx, fy, cx, cy, camera, device):
+        """
+        Generate fisheye rays using Kannala-Brandt undistortion.
+        
+        Matches 3DGUT's kannala_unproject_pixels_to_rays.
+        Reference: threedgrut/datasets/utils.py
+        """
+        # Get distortion coefficients [k1, k2, k3, k4]
+        if self.config.fisheye_distortion is not None:
+            k = torch.tensor(self.config.fisheye_distortion, device=device, dtype=torch.float32)
+        elif hasattr(camera, 'distortion_params'):
+            k = camera.distortion_params.to(device).float()
+        else:
+            raise ValueError("Fisheye requires distortion_params")
+        
+        if len(k) < 4:
+            k = torch.cat([k, torch.zeros(4 - len(k), device=device)])
+        k = k[:4]
+        
+        # Pixel to normalized coordinates
+        u_norm = (x - cx) / fx
+        v_norm = (y - cy) / fy
+        
+        # Radial distance in image plane
+        rho = torch.sqrt(u_norm**2 + v_norm**2)
+        
+        # Azimuthal angle
+        phi = torch.atan2(v_norm, u_norm)
+        
+        # Newton-Raphson iteration to solve: theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8) = rho
+        theta = rho.clone()
+        for _ in range(4):
+            a = k[0] * theta**2
+            b = k[1] * theta**4
+            c = k[2] * theta**6
+            d = k[3] * theta**8
+            
+            # Residual: f(theta) = theta*(1+a+b+c+d) - rho
+            residual = theta * (1 + a + b + c + d) - rho
+            
+            # Derivative: f'(theta) = 1 + 3*a + 5*b + 7*c + 9*d
+            derivative = 1 + 3*a + 5*b + 7*c + 9*d
+            
+            # Avoid division by zero
+            derivative = torch.where(
+                derivative.abs() > 1e-6,
+                derivative,
+                torch.ones_like(derivative) * 1e-6
+            )
+            
+            # Newton step
+            theta = theta - residual / derivative
+        
+        # Convert spherical (theta, phi) to 3D direction in camera space
+        sin_theta = torch.sin(theta)
+        cos_theta = torch.cos(theta)
+        cos_phi = torch.cos(phi)
+        sin_phi = torch.sin(phi)
+        
+        dirs_cam = torch.stack([
+            sin_theta * cos_phi,
+            sin_theta * sin_phi,
+            cos_theta
+        ], dim=-1)
+        
+        # Transform to world space
+        c2w = camera.camera_to_worlds
         if self.training or self.config.use_camopt_in_eval:
-            assert camera.shape[0] == 1, "Only one camera at a time"
-            return self.camera_optimizer.apply_to_camera(camera)
-        else:
-            return camera.camera_to_worlds
-    
-    def _prepare_camera_intrinsics(
-        self,
-        camera: Cameras
-    ) -> Tuple[Tensor, int, int]:
-        """Prepare camera intrinsics and resolution."""
-        camera_scale_fac = self._get_downscale_factor()
-        if camera_scale_fac != 1:
-            camera.rescale_output_resolution(1 / camera_scale_fac)
+            c2w = self.camera_optimizer.apply_to_camera(camera).camera_to_worlds
         
-        K = camera.get_intrinsics_matrices()
-        W = int(camera.width.item())
-        H = int(camera.height.item())
+        R = c2w[0, :3, :3] if c2w.dim() == 3 else c2w[:3, :3]
+        rays_d = (dirs_cam @ R.T)
+        rays_d = rays_d / rays_d.norm(dim=-1, keepdim=True)
         
-        self.last_size = (H, W)  # Store for later use
-        
-        return K, W, H
-    
-    def _prepare_gaussian_colors(self) -> Tensor:
-        """Concatenate SH coefficients into color features."""
-        return torch.cat([self.features_dc, self.features_rest], dim=-1)
-    
-    def _prepare_rolling_shutter_state(self, camera: Cameras) -> Optional[Dict]:
-        """Extract rolling shutter parameters from camera."""
-        camera_times = camera.times
-        
-        if camera_times is None:
-            return None
-        
-        # Get velocity from optimizer
-        if self.training:
-            lin_vel, ang_vel = self.camera_velocity_optimizer.apply_to_camera_velocity(camera)
-        else:
-            if self.config.use_camopt_in_eval:
-                lin_vel, ang_vel = self.camera_velocity_optimizer.apply_to_camera_velocity(camera)
-            else:
-                lin_vel = None
-                ang_vel = None
-        
-        # Compute rolling shutter time
-        if lin_vel is not None and ang_vel is not None:
-            rs_time = camera_times.max() - camera_times.min()
-            return {
-                'lin_vel': lin_vel,
-                'ang_vel': ang_vel,
-                'time': rs_time,
-            }
-        
-        return None
-    
-    def _restore_camera_resolution(self, camera: Cameras):
-        """Restore camera resolution if it was downscaled."""
-        camera_scale_fac = self._get_downscale_factor()
-        if camera_scale_fac != 1:
-            camera.rescale_output_resolution(camera_scale_fac)
-    
-    # ==================== Projection Methods ====================
-    
-    def _gut_projection(
-        self,
-        c2w: Tensor,
-        K: Tensor,
-        W: int,
-        H: int,
-        rs_state: Optional[Dict],
-    ) -> Dict[str, Tensor]:
-        """3DGUT Unscented Transform projection."""
-        return self.gut_projector.project(
-            means=self.means,
-            quats=self.quats,
-            scales=self.scales,
-            opacities=self.opacities,
-            camera_matrix=c2w[0] if c2w.dim() == 3 else c2w,
-            intrinsics=K[0] if K.dim() == 3 else K,
-            resolution=(W, H),
-            rolling_shutter_state=rs_state,
-        )
-    
-    def _ewa_projection(
-        self,
-        c2w: Tensor,
-        K: Tensor,
-        W: int,
-        H: int,
-        rs_state: Optional[Dict],
-    ) -> Dict[str, Tensor]:
-        """Fallback to original EWA splatting projection."""
-        from gsplat.cuda._wrapper import fully_fused_projection
-        
-        viewmat = torch.inverse(c2w)[None]
-        
-        # Extract rolling shutter parameters
-        lin_vel = rs_state['lin_vel'] if rs_state else None
-        ang_vel = rs_state['ang_vel'] if rs_state else None
-        rs_time = rs_state['time'] if rs_state else None
-        
-        radii, means2d, depths, conics, compensations, _ = fully_fused_projection(
-            means=self.means,
-            quats=self.quats,
-            scales=self.scales,
-            opacities=self.opacities,
-            viewmats=viewmat,
-            Ks=K[None],
-            width=W,
-            height=H,
-            linear_velocity=lin_vel,
-            angular_velocity=ang_vel,
-            rolling_shutter_time=rs_time,
-            packed=False,
-        )
-        
-        return {
-            'means2d': means2d[0],
-            'conics': conics[0],
-            'depths': depths[0],
-            'radii': radii[0],
-            'opacities': self.opacities,
-        }
-    
-    # ==================== Rendering Methods ====================
-    
-    def _rasterize_render(
-        self,
-        projected: Dict[str, Tensor],
-        colors: Tensor,
-        W: int,
-        H: int,
-    ) -> Dict[str, Tensor]:
-        """Rasterization rendering (fast, primary rays only)."""
-        from gsplat.rendering import rasterization
-        
-        # Reshape for rasterization API
-        means2d = projected['means2d'][None]
-        conics = projected['conics'][None]
-        opacities = projected['opacities'][None]
-        colors_batch = colors[None]
-        
-        # Dummy viewmat and K (already projected)
-        viewmat = torch.eye(4, device=colors.device)[None]
-        K = torch.eye(3, device=colors.device)[None]
-        
-        render_colors, render_alphas, meta = rasterization(
-            means=self.means,
-            quats=self.quats,
-            scales=self.scales,
-            opacities=opacities[0],
-            colors=colors,
-            viewmats=viewmat,
-            Ks=K,
-            width=W,
-            height=H,
-            render_mode="RGB+ED",
-        )
-        
-        return {
-            'features': render_colors[0],
-            'depth': meta['render_depth'][0] if 'render_depth' in meta else projected['depths'],
-            'alpha': render_alphas[0],
-        }
-    
-    def _ray_trace_render(
-        self,
-        projected: Dict[str, Tensor],
-        colors: Tensor,
-        W: int,
-        H: int,
-    ) -> Dict[str, Tensor]:
-        """Ray tracing rendering (slow, supports secondary rays)."""
-        if self.gut_ray_tracer is None:
-            raise RuntimeError("Ray tracer not initialized")
-        
-        return self.gut_ray_tracer.trace(projected, colors, W, H)
-    
-    # ==================== Decoding ====================
-    
-    def _decode_rgb(
-        self,
-        features: Tensor,
-        camera: Cameras,
-        W: int,
-        H: int,
-    ) -> Tensor:
-        """Decode features to RGB using SplatAD's CNN decoder."""
-        # Compute view directions
-        from nerfstudio.models.splatad import get_ray_dirs_pinhole
-        
-        c2w = self._prepare_camera_pose(camera)
-        ray_dirs = get_ray_dirs_pinhole(camera, W, H, c2w)
-        
-        # Apply CNN decoder
-        rgb = self.rgb_decoder(features, ray_dirs)
-        
-        return rgb.squeeze(0)  # Remove batch dimension
-    
-    # ==================== Inherited Methods (DO NOT OVERRIDE) ====================
-    
-    # The following methods are inherited from SplatADModel and work unchanged:
-    # - get_lidar_outputs()      # LiDAR rendering unchanged
-    # - get_metrics_dict()       # Metrics computation unchanged
-    # - get_loss
+        return rays_d
