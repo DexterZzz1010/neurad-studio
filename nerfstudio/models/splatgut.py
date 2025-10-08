@@ -168,6 +168,8 @@ class SplatGUTModel(SplatADModel):
         if hasattr(self, 'rgb_decoder'):
             from nerfstudio.models.splatad import get_ray_dirs_pinhole
             ray_dirs = get_ray_dirs_pinhole(camera, W, H, c2w)
+            if ray_dirs.dim() == 3:
+                ray_dirs = ray_dirs.unsqueeze(0)  # -> [1, H, W, 3]
             rgb = self.rgb_decoder(outputs['rgb'], ray_dirs).squeeze(0)
         else:
             rgb = outputs['rgb']
