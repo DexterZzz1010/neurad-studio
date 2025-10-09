@@ -1,23 +1,25 @@
 """
-3DGUT Adapter for SplatAD - The Right Way.
+3DGUT Adapter for SplatAD - Feature→SH projection (adaptor-only).
 
-Single responsibility: Convert SplatAD data to 3DGUT format and delegate to Tracer.
-No rendering logic, no parameter conversion - those already exist in threedgut_tracer.
+Single responsibility:
+- Convert SplatAD data to 3DGUT format (Batch + Gaussians)
+- Map flat features (3 + feature_dim) → RGB×SH [3*(L+1)^2] WITHOUT adding trainable params
+- Delegate to threedgut_tracer.Tracer.render()
 
 Design:
     - CamerasToBatchConverter: Cameras → Batch
-    - GaussiansWrapper: SplatAD params → 3DGUT Gaussians interface
-    - Call threedgut_tracer.Tracer.render() directly
-
-Total: ~80 LOC vs previous 400 LOC garbage.
+    - GaussiansWrapper: SplatAD params → 3DGUT Gaussians interface (with Feature→SH)
+    - GUT3DRenderer: only builds Batch & calls Tracer.render()
 """
 
-import torch
-from torch import Tensor
+import math
 import numpy as np
 from typing import Dict, Optional
 
-# 3DGUT imports
+import torch
+from torch import Tensor
+import torch.nn.functional as F
+
 try:
     import threedgut_tracer
     from threedgrut.datasets.protocols import Batch
@@ -29,39 +31,21 @@ try:
     THREEDGUT_AVAILABLE = True
 except ImportError:
     THREEDGUT_AVAILABLE = False
-    print("Warning: threedgut not available, ray tracing disabled")
+    print("Warning: threedgut not available")
 
 
 class CamerasToBatchConverter:
-    """
-    Convert nerfstudio Cameras to 3DGUT Batch.
-
-    Reuses ALL existing 3DGUT logic - we just prepare the data structure.
-    """
+    """Convert nerfstudio Cameras to 3DGUT Batch."""
 
     @staticmethod
-    def convert(
-        camera,
-        camera_to_world: Tensor,  # [4, 4] or [1, 4, 4]
-        rays_o: Tensor,           # [H, W, 3]
-        rays_d: Tensor,           # [H, W, 3]
-        camera_model: str = "pinhole",  # From config
-        fisheye_distortion: Optional[np.ndarray] = None,  # From config or camera
-    ) -> Batch:
-        """
-        Build Batch matching 3DGUT's __getitem__ output.
-        Tracer.__create_camera_parameters() will handle the rest.
-        """
+    def convert(camera, camera_to_world: Tensor, rays_o: Tensor, rays_d: Tensor,
+                camera_model: str = "pinhole", fisheye_distortion: Optional[np.ndarray] = None) -> Batch:
         H, W = rays_o.shape[:2]
         c2w = camera_to_world[0] if camera_to_world.dim() == 3 else camera_to_world
 
-        # Extract intrinsics
-        fx = float(camera.fx.item())
-        fy = float(camera.fy.item())
-        cx = float(camera.cx.item())
-        cy = float(camera.cy.item())
+        fx = float(camera.fx.item()); fy = float(camera.fy.item())
+        cx = float(camera.cx.item()); cy = float(camera.cy.item())
 
-        # Infer camera model if "auto"
         if camera_model == "auto":
             dist_params = getattr(camera, 'distortion_params', None)
             if dist_params is not None and not (dist_params == 0).all():
@@ -70,19 +54,16 @@ class CamerasToBatchConverter:
             else:
                 camera_model = "pinhole"
 
-        # Build 3DGUT camera model parameters
         if camera_model == "fisheye":
             if fisheye_distortion is None:
                 dist_params = getattr(camera, 'distortion_params', None)
                 if dist_params is None:
                     raise ValueError("Fisheye model requires distortion_params.")
                 fisheye_distortion = dist_params.detach().cpu().numpy() if isinstance(dist_params, Tensor) else dist_params
-
-            # Ensure 4 coefficients [k1, k2, k3, k4]
-            if len(fisheye_distortion) < 4:
-                fisheye_distortion = np.pad(np.asarray(fisheye_distortion, dtype=np.float32), (0, 4 - len(fisheye_distortion)))
-            else:
-                fisheye_distortion = np.asarray(fisheye_distortion[:4], dtype=np.float32)
+            fisheye_distortion = np.asarray(fisheye_distortion, dtype=np.float32)
+            if fisheye_distortion.shape[0] < 4:
+                fisheye_distortion = np.pad(fisheye_distortion, (0, 4 - fisheye_distortion.shape[0]))
+            fisheye_distortion = fisheye_distortion[:4].astype(np.float32)
 
             params = OpenCVFisheyeCameraModelParameters(
                 principal_point=np.array([cx, cy], dtype=np.float32),
@@ -105,252 +86,231 @@ class CamerasToBatchConverter:
             )
             intrinsics_key = "intrinsics_OpenCVPinholeCameraModelParameters"
 
-        # 3DGUT 期望 [1, H, W, 3]
-        rays_o_b = rays_o.unsqueeze(0).contiguous()
-        rays_d_b = rays_d.unsqueeze(0).contiguous()
-        c2w_b = c2w.unsqueeze(0).contiguous()
-
         return Batch(**{
-            'rays_ori': rays_o_b,
-            'rays_dir': rays_d_b,
-            'T_to_world': c2w_b,
+            'rays_ori': rays_o.unsqueeze(0).contiguous(),
+            'rays_dir': rays_d.unsqueeze(0).contiguous(),
+            'T_to_world': c2w.unsqueeze(0).contiguous(),
             intrinsics_key: params.to_dict(),
         })
 
     @staticmethod
     def _compute_fisheye_max_angle(fx, fy, cx, cy, W, H):
-        """From dataset_colmap.py - compute FOV proxy for fisheye."""
         max_radius = np.sqrt(max(
-            cx**2 + cy**2,
-            (W - cx)**2 + cy**2,
-            cx**2 + (H - cy)**2,
-            (W - cx)**2 + (H - cy)**2,
+            cx**2 + cy**2, (W - cx)**2 + cy**2,
+            cx**2 + (H - cy)**2, (W - cx)**2 + (H - cy)**2,
         ))
         return float(max(2.0 * max_radius / fx, 2.0 * max_radius / fy) / 2.0)
 
 
 class GaussiansWrapper:
-    """Wrap SplatAD parameters in 3DGUT's Gaussians interface with auto-normalization."""
+    """
+    3DGUT Gaussians wrapper - CRITICAL FIX for compiled degree.
+    
+    3DGUT kernels are compiled with a fixed degree (default 3).
+    We MUST match this degree, padding features if necessary.
+    """
 
     def __init__(self, model, camera_extent=None):
         self.model = model
+        device = model.means.device
+        dtype = torch.float32
+        
+        print(f"[GaussiansWrapper] Using device: {device} (type={device.type}, index={device.index})")
 
-        # ================== 空间尺度诊断 + 自动归一化 ==================
-        means = model.means  # [N, 3]
-        means_center = means.mean(dim=0)  # [3]
-        means_std = means.std()  # scalar
-
-        means_min = means.min()
-        means_max = means.max()
+        # ============ POSITIONS: normalize ============
+        cfg = getattr(model, "config", None)
+        target_radius = float(getattr(cfg, "target_radius", 200.0))
+        
+        raw_means = model.means
+        if not raw_means.is_cuda or raw_means.dtype != dtype:
+            raw_means = raw_means.to(device=device, dtype=dtype)
+        
+        means_min = raw_means.min().item()
+        means_max = raw_means.max().item()
         means_range = means_max - means_min
-
-        print(f"\n{'='*70}")
-        print(f"Gaussians Spatial Analysis")
-        print(f"{'='*70}")
-        print(f"means range: [{means_min.item():.2f}, {means_max.item():.2f}]")
-        print(f"means center: {means_center.detach().cpu().numpy()}")
-        print(f"means std: {means_std.item():.2f}")
-        print(f"means span: {means_range.item():.2f}")
-
-        REASONABLE_RANGE = 200.0
-        if means_range > REASONABLE_RANGE:
-            print(f"\n⚠️  WARNING: Gaussian positions out of reasonable range!")
-            print(f"   Range {means_range.item():.2f} >> {REASONABLE_RANGE}")
-            print(f"   Applying automatic normalization...")
-
-            TARGET_SCALE = 50.0
-            scale_factor = TARGET_SCALE / (3.0 * (means_std + 1e-12))
-
-            print(f"   Normalization params:")
-            print(f"     center: {means_center.detach().cpu().numpy()}")
-            print(f"     scale_factor: {float(scale_factor):.6f}")
-
-            normalized_means = (means - means_center) * scale_factor
-
-            new_min = normalized_means.min()
-            new_max = normalized_means.max()
-            new_std = normalized_means.std()
-            print(f"   After normalization:")
-            print(f"     range: [{new_min.item():.2f}, {new_max.item():.2f}]")
-            print(f"     std: {new_std.item():.2f}")
-            print(f"{'='*70}\n")
-
-            self.normalization_center = means_center
-            self.normalization_scale = scale_factor
-            self.positions = normalized_means.contiguous()
-        else:
-            print(f"✓ Gaussian positions in reasonable range, no normalization needed")
-            print(f"{'='*70}\n")
-            self.normalization_center = None
-            self.normalization_scale = None
-            self.positions = means.contiguous()
-
+        print(f"[GaussiansWrapper] Raw position range: [{means_min:.2f}, {means_max:.2f}] (span={means_range:.2f})")
+        
+        if means_range > 1e7:
+            print(f"⚠️  WARNING: Extremely large position range ({means_range:.2e})!")
+            print(f"    This suggests numerical issues upstream. Proceeding with normalization...")
+        
+        self.positions, self.normalization_center, self.normalization_scale = \
+            self._normalize_positions_to_radius(raw_means, target_radius)
+        
+        pos_min = self.positions.min().item()
+        pos_max = self.positions.max().item()
+        print(f"[GaussiansWrapper] Normalized position range: [{pos_min:.2f}, {pos_max:.2f}]")
+        
+        assert self.positions.device == device and self.positions.dtype == dtype
+        assert self.positions.is_contiguous()
         self.num_gaussians = self.positions.shape[0]
 
-        # ================== 特征通道构建（关键修复） ==================
-        # 目标：最终 features 形状为 [N, 3*(L+1)^2]，且 n_active_features 与之相等
-        N = self.model.features_dc.shape[0]
-        dc = self.model.features_dc  # [N, 3]
+        # ============ ROTATION/SCALE/DENSITY ============
+        rot = model.quats.to(dtype=dtype, device=device)
+        rot = F.normalize(rot, dim=-1)
+        assert torch.isfinite(rot).all() and (rot.norm(dim=-1) > 0.99).all()
+        self.rotation = rot.contiguous()
 
-        rest = getattr(self.model, "features_rest", None)
-        rest_flat = None
+        log_scale = model.scales.to(dtype=dtype, device=device)
+        log_scale_clamped = torch.clamp(log_scale, min=-10, max=5)
+        if (log_scale != log_scale_clamped).any():
+            print(f"⚠️  WARNING: Clamped {(log_scale != log_scale_clamped).sum()} scale values")
+        scl = torch.exp(log_scale_clamped)
+        assert torch.isfinite(scl).all() and (scl > 0).all()
+        self.scale = scl.contiguous()
 
-        if rest is not None and rest.numel() > 0:
-            if rest.dim() == 3 and rest.shape[-1] == 3:
-                # Case B: [N, ((L+1)^2 - 1), 3] -> flatten to [N, ((L+1)^2 - 1)*3]
-                rest_flat = rest.reshape(N, -1)
-            elif rest.dim() == 2:
-                # Case A: [N, K] — 已展平或灰度
-                K = rest.shape[1]
-                if K % 3 == 0:
-                    # 已经是 RGB 展平的高阶项
-                    rest_flat = rest
-                else:
-                    # 灰度 SH（((L+1)^2 - 1)），临时扩展到 RGB 以跑通
-                    print("⚠️  features_rest appears grayscale; expanding to RGB by replication.")
-                    rest_flat = rest.unsqueeze(-1).expand(-1, -1, 3).reshape(N, -1)
-            else:
-                raise RuntimeError(f"Unexpected features_rest shape: {tuple(rest.shape)}")
-        else:
-            # 仅 DC
-            rest_flat = torch.empty((N, 0), device=dc.device, dtype=dc.dtype)
+        logit_opa = model.opacities.to(dtype=dtype, device=device)
+        den = torch.sigmoid(logit_opa)
+        if den.dim() == 1:
+            den = den.unsqueeze(-1)
+        assert den.shape == (self.num_gaussians, 1)
+        assert torch.isfinite(den).all()
+        self.density = den.contiguous()
 
-        features = torch.cat([dc, rest_flat], dim=1).contiguous()  # [N, F]
-        F = features.shape[1]
+        self.rotation_activation = lambda x: x
+        self.scale_activation = lambda x: x
+        self.density_activation = lambda x: x
 
-        # 强校验：F 必须满足 3*(L+1)^2
-        if F % 3 != 0:
-            raise RuntimeError(f"Radiance features ({F}) must be multiple of 3 (RGB).")
-        m = F // 3
-        L_float = np.sqrt(m) - 1.0
-        L = int(round(L_float))
-        if (L + 1) ** 2 != m:
-            raise RuntimeError(f"Radiance channels={F} invalid; expect 3*(L+1)^2. Got m={m}.")
+        # ============ FEATURES: FORCE DEGREE=3 TO MATCH COMPILED KERNEL ============
+        if not hasattr(model, 'features_rest'):
+            raise AttributeError("model.features_rest not found")
+        
+        raw_rest = model.features_rest
+        actual_K = int(raw_rest.shape[1])
+        
+        # CRITICAL: 3DGUT default config has particle_radiance_sph_degree=3
+        # Kernel is compiled with PARTICLE_RADIANCE_NUM_COEFFS=(3+1)^2=16
+        # We MUST provide degree=3 features, padding if necessary
+        COMPILED_DEGREE = 3
+        self._sh_degree = COMPILED_DEGREE
+        M = (COMPILED_DEGREE + 1) ** 2 - 1  # 15
+        self.feature_width = 3 * (M + 1)    # 48
+        self.n_active_features = COMPILED_DEGREE  # 3 (for tracer API)
+        
+        print(f"[GaussiansWrapper] Forcing SH degree={COMPILED_DEGREE} to match compiled kernel")
+        print(f"[GaussiansWrapper] Required feature width: {self.feature_width} (actual K: {actual_K})")
+        
+        # Build projection matrix W: [actual_K, 3*M] = [K, 45]
+        if not hasattr(model, "_adaptor_W_cache"):
+            model._adaptor_W_cache = {}
+        
+        cache_key = (actual_K, 3 * M, str(dtype), str(device))
+        W = model._adaptor_W_cache.get(cache_key)
+        if W is None:
+            W = torch.empty(actual_K, 3 * M, device=device, dtype=dtype)
+            torch.nn.init.orthogonal_(W, gain=1.0)
+            W *= (1.0 / max(1, actual_K))
+            model._adaptor_W_cache[cache_key] = W
+            print(f"[GaussiansWrapper] Created projection W: {tuple(W.shape)} on {W.device}")
+        
+        assert W.device == device, f"W device {W.device} != target {device}"
+        self._W = W
 
-        # 保存
-        self._features = features
-        self.n_active_features = F  # 关键：用拼接后的真实通道数
+        # Build features [N, 48] with coefficient-first RGB interleaving
+        dc = model.features_dc.to(dtype=dtype, device=device)
+        rest = raw_rest.to(dtype=dtype, device=device)
 
-        # 额外：把推断出的 L 写回配置（若存在），避免跑偏
-        cfg = getattr(self.model, "config", None)
+        assert dc.shape == (self.num_gaussians, 3)
+        assert rest.shape == (self.num_gaussians, actual_K)
+
+        # Project: [N,K] @ [K,45] = [N,45], reshape to [N,3,15]
+        proj = rest @ self._W
+        proj = proj.view(-1, 3, M)
+        
+        # Interleave: DC + projected high-order coeffs
+        r = torch.cat([dc[:, 0:1], proj[:, 0, :]], dim=1)  # [N, 16]
+        g = torch.cat([dc[:, 1:2], proj[:, 1, :]], dim=1)  # [N, 16]
+        b = torch.cat([dc[:, 2:3], proj[:, 2, :]], dim=1)  # [N, 16]
+        
+        # Coefficient-first interleaving: [N, 16, 3] -> [N, 48]
+        interleaved = torch.stack([r, g, b], dim=-1)
+        features = interleaved.reshape(-1, 3 * (M + 1))
+
+        assert features.shape == (self.num_gaussians, self.feature_width), \
+            f"Feature shape {features.shape} vs expected ({self.num_gaussians}, {self.feature_width})"
+        assert features.device == device and features.dtype == dtype
+        assert features.is_contiguous()
+        assert torch.isfinite(features).all()
+        
+        self.features = features
+        
+        print(f"[GaussiansWrapper] Init complete: {self.num_gaussians} gaussians")
+        print(f"  SH degree: {self._sh_degree}, feature_width: {self.feature_width}, n_active_features: {self.n_active_features}")
+
         try:
-            if cfg is not None and hasattr(cfg, "particle_radiance_sph_degree"):
-                if getattr(cfg, "particle_radiance_sph_degree") != L:
-                    print(f"ℹ️  Overriding config.particle_radiance_sph_degree -> {L}")
-                    cfg.particle_radiance_sph_degree = L
+            if cfg is not None:
+                cfg.particle_radiance_sph_degree = self._sh_degree
         except Exception:
             pass
 
-    # ---------- 3DGUT 访问接口 ----------
-    def get_rotation(self):
-        """Return normalized quaternions as [N, 4]."""
-        quats = self.model.quats
-        return quats / (quats.norm(dim=-1, keepdim=True) + 1e-8)
+    @staticmethod
+    def _normalize_positions_to_radius(means: torch.Tensor, target_radius: float):
+        """Normalize positions to fit within target_radius sphere."""
+        assert means.is_cuda and means.dtype == torch.float32
+        assert target_radius > 0
 
-    def get_scale(self):
-        """Return activated scales as [N, 3] (exp)."""
-        return torch.exp(self.model.scales)
+        center = means.mean(dim=0, keepdim=False)
+        centered = means - center
 
-    def get_density(self):
-        """Return activated opacity as [N, 1] (sigmoid, column vector)."""
-        opacities = torch.sigmoid(self.model.opacities)
-        if opacities.dim() == 1:
-            opacities = opacities.unsqueeze(-1)
-        return opacities
+        dists = torch.linalg.norm(centered, dim=-1)
+        q99 = torch.quantile(dists, 0.99).item()
+        linf = centered.abs().amax().item()
+        
+        radius = max(q99, linf * 0.5, 1e-6)
+        scale_factor = target_radius / radius
 
-    def get_features(self):
-        """Return [N, 3*(L+1)^2] contiguous RGB SH features."""
-        # 再次保底健诊
-        feat = self._features
-        assert feat.is_cuda and feat.dtype == torch.float32 and feat.is_contiguous()
-        assert torch.isfinite(feat).all(), "features contain NaN/Inf"
-        F = feat.shape[1]
-        assert F == self.n_active_features, f"Feature mismatch: {F} vs {self.n_active_features}"
-        return feat
+        print(f"[normalize] center={center.tolist()}, radius={radius:.2f}, scale={scale_factor:.2e}")
+
+        normalized = centered * scale_factor
+        normalized = torch.clamp(normalized, min=-2.0 * target_radius, max=2.0 * target_radius)
+
+        assert normalized.is_cuda and normalized.dtype == torch.float32
+        assert torch.isfinite(normalized).all()
+
+        return normalized.contiguous(), center.detach(), torch.tensor(scale_factor, device=means.device)
+
+    def get_rotation(self): return self.rotation
+    def get_scale(self): return self.scale
+    def get_density(self): return self.density
+    def get_features(self): return self.features
 
     def background(self, T_to_world, rays_d, pred_rgb, pred_opacity, train):
-        """Composite with background (optional, usually no-op)."""
         return pred_rgb, pred_opacity
 
 
 class GUT3DRenderer:
-    """
-    Thin wrapper around threedgut_tracer.Tracer.
-
-    Only job: Convert data and delegate to Tracer.render().
-    """
+    """Thin wrapper around threedgut_tracer.Tracer."""
 
     def __init__(self, config: dict):
-        """Initialize 3DGUT Tracer with config."""
         if not THREEDGUT_AVAILABLE:
-            raise ImportError("threedgut_tracer is not available.")
+            raise ImportError("threedgut_tracer not available")
         from omegaconf import OmegaConf
         self.tracer = threedgut_tracer.Tracer(OmegaConf.create(config))
+        self._first_render = True
 
     def render(self, model, camera, rays_o, rays_d, c2w) -> Dict[str, Tensor]:
-        """
-        Render using 3DGUT.
-
-        Steps:
-            1. Wrap Gaussians
-            2. Build Batch (with camera model from config)
-            3. Call Tracer.render()
-            4. Done
-        """
-
-        # ================== 数据健康检查 ==================
-        print("\n" + "="*70)
-        print("PRE-RENDER DATA VALIDATION")
-        print("="*70)
-
-        def check_tensor(name, t):
-            print(f"{name}:")
-            print(f"  shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}")
-            print(f"  contiguous={t.is_contiguous()}")
-            t_min = float(torch.nan_to_num(t).min().item())
-            t_max = float(torch.nan_to_num(t).max().item())
-            print(f"  range=[{t_min:.4f}, {t_max:.4f}]")
-            if torch.isnan(t).any():
-                raise RuntimeError(f"NaN in {name}")
-            if torch.isinf(t).any():
-                raise RuntimeError(f"Inf in {name}")
-
-        check_tensor("model.quats", model.quats)
-        check_tensor("model.scales", model.scales)
-        check_tensor("model.opacities", model.opacities)
-        check_tensor("model.means", model.means)
-        check_tensor("rays_o", rays_o)
-        check_tensor("rays_d", rays_d)
-
-        print("="*70 + "\n")
-
-        # 1) Wrap Gaussians
         gaussians = GaussiansWrapper(model)
 
-        # 2) Debug 输出一次形状概览
-        if not hasattr(self, '_debug_printed'):
+        if self._first_render:
             print("\n" + "="*70)
-            print("3DGUT Renderer - Data Shapes")
+            print("3DGUT RENDERER - FIRST RENDER")
             print("="*70)
-            print(f"Gaussians:")
-            print(f"  num_gaussians: {gaussians.num_gaussians}")
-            print(f"  positions: {gaussians.positions.shape} {gaussians.positions.dtype} {gaussians.positions.device}")
-            print(f"  rotation: {gaussians.get_rotation().shape} {gaussians.get_rotation().dtype}")
-            print(f"  scale: {gaussians.get_scale().shape} {gaussians.get_scale().dtype}")
-            print(f"  density: {gaussians.get_density().shape} {gaussians.get_density().dtype}")
-            print(f"  features: {gaussians.get_features().shape} {gaussians.get_features().dtype}")
-            print(f"  n_active_features: {gaussians.n_active_features}")
-            print(f"\nRays:")
-            print(f"  rays_o: {rays_o.shape} {rays_o.dtype} {rays_o.device}")
-            print(f"  rays_d: {rays_d.shape} {rays_d.dtype} {rays_d.device}")
-            print(f"  c2w: {c2w.shape} {c2w.dtype}")
+            print(f"Gaussians: {gaussians.num_gaussians} particles")
+            print(f"  positions: {tuple(gaussians.positions.shape)} {gaussians.positions.dtype}")
+            print(f"  rotation: {tuple(gaussians.rotation.shape)}")
+            print(f"  scale: {tuple(gaussians.scale.shape)}")
+            print(f"  density: {tuple(gaussians.density.shape)}")
+            print(f"  features: {tuple(gaussians.features.shape)} (padded for degree=3)")
+            print(f"  n_active_features (for tracer): {gaussians.n_active_features}")
+            print(f"Rays: {tuple(rays_o.shape)}")
             print("="*70 + "\n")
-            self._debug_printed = True
+            self._first_render = False
 
-        # 3) Cameras → Batch
         fisheye_dist = None
-        if hasattr(model, 'config') and hasattr(model.config, 'fisheye_distortion') and model.config.fisheye_distortion is not None:
-            fisheye_dist = np.array(model.config.fisheye_distortion, dtype=np.float32)
+        if hasattr(model, 'config'):
+            fisheye_dist = getattr(model.config, 'fisheye_distortion', None)
+            if fisheye_dist is not None:
+                fisheye_dist = np.array(fisheye_dist, dtype=np.float32)
 
         batch = CamerasToBatchConverter.convert(
             camera=camera,
@@ -361,20 +321,16 @@ class GUT3DRenderer:
             fisheye_distortion=fisheye_dist,
         )
 
-        # 4) 调用 Tracer.render
         try:
             outputs = self.tracer.render(gaussians, batch, train=model.training)
         except RuntimeError as e:
             print(f"\n[ERROR] 3DGUT render failed: {e}")
-            print(f"Gaussians info:")
-            print(f"  num: {gaussians.num_gaussians}")
+            print(f"Gaussians: {gaussians.num_gaussians} particles")
             print(f"  n_active_features: {gaussians.n_active_features}")
-            print(f"  All shapes:")
-            print(f"    positions: {gaussians.positions.shape}")
-            print(f"    rotation: {gaussians.get_rotation().shape}")
-            print(f"    scale: {gaussians.get_scale().shape}")
-            print(f"    density: {gaussians.get_density().shape}")
-            print(f"    features: {gaussians.get_features().shape}")
+            print(f"  feature_width: {gaussians.feature_width}")
+            print("Tensor shapes:")
+            print(f"  positions: {tuple(gaussians.positions.shape)}")
+            print(f"  features: {tuple(gaussians.features.shape)}")
             raise
 
         return {

@@ -65,6 +65,7 @@ class SplatGUTModel(SplatADModel):
         - get_outputs_for_camera(): EWA → UT ray tracing
     """
     
+
     config: SplatGUTModelConfig
     
     def populate_modules(self):
@@ -128,61 +129,90 @@ class SplatGUTModel(SplatADModel):
     def get_outputs_for_camera(self, camera: Cameras) -> Dict[str, Tensor]:
         """
         Render camera with 3DGUT ray tracing.
-        
+
         Pipeline:
-            1. Generate rays (nerfstudio helper)
-            2. Apply camera optimization (SplatAD logic)
-            3. Render with 3DGUT
-            4. Decode RGB (SplatAD decoder)
+            1) 生成射线（含可选相机优化与降采样）
+            2) 调 3DGUT 渲染
+            3) 若 3DGUT 返回“特征图”，再走 SplatAD 的解码器；否则直接用成品 RGB
+            4) 与背景合成；返回 rgb / depth / accumulation / background
         """
-        
         if not self.config.use_ray_tracing:
-            # Fallback to parent's rasterization
             return super().get_outputs_for_camera(camera)
-        
-        # Step 1: Prepare camera (SplatAD logic)
+
+        # Step 1: 相机优化 & 降采样
         if self.training or self.config.use_camopt_in_eval:
             camera = self.camera_optimizer.apply_to_camera(camera)
-        
-        # Handle downscaling
+
         scale = self._get_downscale_factor()
         if scale != 1:
             camera.rescale_output_resolution(1 / scale)
-        
+
         W, H = int(camera.width.item()), int(camera.height.item())
         c2w = camera.camera_to_worlds
-        
-        # Step 2: Generate rays (standard pinhole for now)
+
+        # 生成射线
         rays_o, rays_d = self._generate_camera_rays(camera, W, H, c2w)
-        
-        # Step 3: Render with 3DGUT (THE CORE CHANGE)
-        outputs = self.gut_renderer.render(
-            model=self,  # Pass self so GaussiansWrapper can access params
+
+        # Step 2: 3DGUT 渲染
+        outs = self.gut_renderer.render(
+            model=self,
             camera=camera,
             rays_o=rays_o,
             rays_d=rays_d,
             c2w=c2w,
         )
-        
-        # Step 4: Decode RGB if decoder present
-        if hasattr(self, 'rgb_decoder'):
+
+        feat_or_rgb = outs["rgb"]     # [H,W,3] or [H,W,C_feat]
+        alpha       = outs["alpha"]   # [H,W] or [H,W,1]
+        depth       = outs["depth"]   # [H,W] or [H,W,1]
+
+        # 规范形状
+        if alpha.ndim == 2:
+            alpha_ = alpha.unsqueeze(-1)     # -> [H,W,1]
+        else:
+            alpha_ = alpha
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth_ = depth.squeeze(-1)       # -> [H,W]
+        else:
+            depth_ = depth
+
+        # Step 3: 仅当 3DGUT 返回“特征图”时才调用解码器
+        if feat_or_rgb.ndim == 3 and feat_or_rgb.shape[-1] == 3:
+            rgb_fg = feat_or_rgb            # 成品前景 RGB
+        else:
+            if not hasattr(self, "rgb_decoder"):
+                raise RuntimeError(
+                    "3DGUT returned a feature map but 'rgb_decoder' is not available. "
+                    "Either enable the decoder or configure tracer to output final RGB."
+                )
             from nerfstudio.models.splatad import get_ray_dirs_pinhole
             ray_dirs = get_ray_dirs_pinhole(camera, W, H, c2w)
             if ray_dirs.dim() == 3:
-                ray_dirs = ray_dirs.unsqueeze(0)  # -> [1, H, W, 3]
-            rgb = self.rgb_decoder(outputs['rgb'], ray_dirs).squeeze(0)
+                ray_dirs = ray_dirs.unsqueeze(0)                  # [1,H,W,3]
+            appearance = self._get_appearance_embedding(camera, feat_or_rgb)  # [H,W,8]
+            features   = torch.cat([feat_or_rgb, appearance], dim=-1)         # [H,W,24]
+            rgb_fg     = self.rgb_decoder(features, ray_dirs).squeeze(0)      # [H,W,3]
+
+        # Step 4: 背景合成 + 返回 background（供 metrics 使用）
+        bg = self._get_background_color()      # [3] or [H,W,3]
+        if bg.ndim == 1:
+            bg_img = bg.view(1, 1, 3).expand(H, W, 3)
         else:
-            rgb = outputs['rgb']
-        
-        # Restore resolution
+            bg_img = bg                         # 已是 [H,W,3]
+
+        rgb = torch.clamp(rgb_fg * alpha_ + (1.0 - alpha_) * bg_img, 0.0, 1.0)
+
+        # 还原分辨率
         if scale != 1:
             camera.rescale_output_resolution(scale)
-        
+
         return {
-            'rgb': rgb,
-            'depth': outputs['depth'],
-            'accumulation': outputs['alpha'],
+            "rgb": rgb,                           # [H,W,3]  已与背景合成
+            "depth": depth_,                      # [H,W]
+            "accumulation": alpha_.squeeze(-1),   # [H,W]
+            "background": bg_img,                 # [H,W,3]  供 metrics 对 GT 合成使用
         }
+
     
     def _generate_camera_rays(self, camera, W, H, c2w):
         """
