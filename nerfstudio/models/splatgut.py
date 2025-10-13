@@ -129,22 +129,27 @@ class SplatGUTModel(SplatADModel):
     def get_param_groups(self) -> Dict[str, list]:
         """
         Define optimizer parameter groups.
-        
-        SplatAD uses gauss_params dict, not self.gaussians.
+
         """
         groups = super().get_param_groups()
         
-        # Add SH high-order to sh group
+        # Get or create sh group
         sh_group = groups.get("sh", [])
+        
+        # Track existing parameter IDs
+        existing_ids = {id(p) for p in sh_group}
         
         # Add features_dc from gauss_params
         for key, val in self.gauss_params.items():
-            if 'features_dc' in key.lower() and val not in sh_group:
-                sh_group.append(val)
+            if 'features_dc' in key.lower():
+                if id(val) not in existing_ids:
+                    sh_group.append(val)
+                    existing_ids.add(id(val))
         
         # Add sh_high_order
-        if hasattr(self, 'sh_high_order') and self.sh_high_order not in sh_group:
-            sh_group.append(self.sh_high_order)
+        if hasattr(self, 'sh_high_order'):
+            if id(self.sh_high_order) not in existing_ids:
+                sh_group.append(self.sh_high_order)
         
         groups["sh"] = sh_group
         
