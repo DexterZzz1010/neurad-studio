@@ -1,20 +1,17 @@
 """
-SplatGUT: SplatAD + 3DGUT Ray Tracing.
+SplatGUT: Hybrid rendering.
 
-Inherits ALL SplatAD logic (scene graph, optimization, losses).
-Only overrides camera rendering: EWA splatting → Unscented Transform ray tracing.
-
-Linus principles:
-    1. Eliminate special cases: Same Model interface for both renderers
-    2. Practical: Graceful degradation if 3DGUT unavailable
-    3. Simple: Override ONE method, ~50 LOC
+Design:
+    - Camera: 3DGUT ray tracing
+    - LiDAR: gsplat (inherited)
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Type
+from typing import Dict, Type
 
 import torch
-from torch import Tensor
+import torch.nn.functional as F
+from torch import nn, Tensor
 
 from nerfstudio.models.splatad import SplatADModel, SplatADModelConfig
 from nerfstudio.cameras.cameras import Cameras
@@ -22,317 +19,262 @@ from nerfstudio.cameras.cameras import Cameras
 
 @dataclass
 class SplatGUTModelConfig(SplatADModelConfig):
-    """SplatGUT config - adds ray tracing + camera model selection."""
-    
     _target: Type = field(default_factory=lambda: SplatGUTModel)
-    
+
+    sh_degree: int = 2
+    target_radius: float = 200.0
     use_ray_tracing: bool = True
-    """Enable 3DGUT ray tracing. Slower but handles distortion/rolling shutter."""
-    
-    camera_model: str = "pinhole"
-    """Camera model: 'pinhole', 'fisheye', or 'auto' (infer from distortion_params)."""
-    
-    # Fisheye distortion coefficients (if camera_model="fisheye" and not in dataparser)
-    fisheye_distortion: Optional[list] = None
-    """[k1, k2, k3, k4] for fisheye. If None, read from camera.distortion_params."""
-    
-    # 3DGUT-specific rendering parameters
     k_buffer_size: int = 32
-    """Max Gaussians per ray (memory vs quality trade-off)."""
-    
     ut_alpha: float = 1.0
-    """Unscented Transform spread parameter (default: 1.0)."""
-    
     ut_beta: float = 0.0
-    """Unscented Transform kurtosis parameter (default: 0.0)."""
+    camera_model: str = "pinhole"
+    fisheye_distortion: list = None
+    use_camopt_in_eval: bool = True
 
 
 class SplatGUTModel(SplatADModel):
-    """
-    SplatAD with 3DGUT.
-    
-    Inheritance chain:
-        Model → ADModel → SplatADModel → SplatGUTModel
-    
-    Inherited (unchanged):
-        - populate_modules(): Gaussians, scene graph, decoders, optimizers
-        - get_outputs(): RGB + LiDAR rendering pipeline
-        - get_loss_dict(): All loss functions
-        - get_metrics_dict(): PSNR, SSIM, etc.
-        - Dynamic actors, MCMC refinement, camera optimization
-    
-    Overridden (this file):
-        - get_outputs_for_camera(): EWA → UT ray tracing
-    """
-    
-
     config: SplatGUTModelConfig
-    
+
     def populate_modules(self):
-        """Initialize all modules (calls parent for everything)."""
+        """Initialize modules after parent creates gauss_params."""
         super().populate_modules()
         
+        # Setup SH from gauss_params
+        self._setup_sh_from_gauss_params()
+        
+        # Initialize 3DGUT renderer
         if self.config.use_ray_tracing:
-            # Lazy import to avoid circular dependency
-            try:
-                from nerfstudio.adapters.threedgut_adapter import GUT3DRenderer, THREEDGUT_AVAILABLE
-            except ImportError as e:
-                print(f"[ERROR] Failed to import threedgut_adapter: {e}")
-                print("[WARN] Falling back to rasterization")
-                self.config.use_ray_tracing = False
-                return
-            
-            if not THREEDGUT_AVAILABLE:
-                print("[WARN] 3DGUT not available, falling back to rasterization")
-                self.config.use_ray_tracing = False
-                return
-            
-            # Get sh_degree safely (might be sh_degree_max or num_sh_degree)
-            sh_degree = getattr(self.config, 'sh_degree', 
-                               getattr(self.config, 'sh_degree_max',
-                                      getattr(self, 'num_sh_degree', 3)))
-            
-            # Build 3DGUT config (minimal required params)
-            gut_config = {
-                'render': {
-                    'method': '3dgut',
-                    'particle_radiance_sph_degree': sh_degree,
-                    'particle_kernel_degree': 2,
-                    'particle_kernel_min_response': 0.0,
-                    'particle_kernel_min_alpha': 0.0,
-                    'particle_kernel_max_alpha': 1.0,
-                    'min_transmittance': 0.001,
-                    'enable_hitcounts': True,
-                    'splat': {
-                        'n_rolling_shutter_iterations': 1,
-                        'k_buffer_size': self.config.k_buffer_size,
-                        'global_z_order': False,
-                        'ut_alpha': self.config.ut_alpha,
-                        'ut_beta': self.config.ut_beta,
-                        'ut_kappa': 0.0,
-                        'ut_in_image_margin_factor': 1.5,
-                        'ut_require_all_sigma_points_valid': False,
-                        'rect_bounding': True,
-                        'tight_opacity_bounding': True,
-                        'tile_based_culling': True,
-                    }
+            self._init_gut_renderer()
+
+    def _setup_sh_from_gauss_params(self):
+        """
+        Create SH parameters from gauss_params dictionary.
+        
+        SplatAD stores Gaussians in self.gauss_params dict, not self.gaussians.
+        """
+        L = self.config.sh_degree
+        M = (L + 1) ** 2
+        
+        # Find means to determine N and device
+        means = None
+        features_dc = None
+        features_rest_key = None
+        
+        for key, val in self.gauss_params.items():
+            if 'means' in key.lower():
+                means = val
+            elif 'features_dc' in key.lower():
+                features_dc = val
+            elif 'features_rest' in key.lower():
+                features_rest_key = key
+        
+        if means is None:
+            raise RuntimeError("Cannot find 'means' in gauss_params")
+        
+        N = means.shape[0]
+        device = means.device
+        dtype = means.dtype
+        
+        # Create high-order SH parameter
+        self.sh_high_order = nn.Parameter(
+            torch.zeros(N, 3, M - 1, device=device, dtype=dtype)
+        )
+        
+        # Replace features_rest in gauss_params
+        if features_rest_key is not None:
+            self.gauss_params[features_rest_key] = self.sh_high_order
+        
+        print(f"[SplatGUT] SH initialized: N={N}, L={L}, M={M}")
+
+    def _init_gut_renderer(self):
+        """Initialize 3DGUT renderer."""
+        try:
+            from nerfstudio.adapters.threedgut_adapter import GUT3DRenderer, THREEDGUT_AVAILABLE
+        except ImportError as e:
+            raise ImportError(f"3DGUT adapter not found: {e}")
+        
+        if not THREEDGUT_AVAILABLE:
+            raise ImportError("3DGUT not installed")
+        
+        L = self.config.sh_degree
+        config = {
+            'render': {
+                'method': '3dgut',
+                'particle_radiance_sph_degree': L,
+                'particle_kernel_degree': 2,
+                'particle_kernel_min_response': 0.0,
+                'particle_kernel_min_alpha': 0.0,
+                'particle_kernel_max_alpha': 1.0,
+                'min_transmittance': 0.001,
+                'enable_hitcounts': True,
+                'splat': {
+                    'n_rolling_shutter_iterations': 1,
+                    'k_buffer_size': self.config.k_buffer_size,
+                    'global_z_order': False,
+                    'ut_alpha': self.config.ut_alpha,
+                    'ut_beta': self.config.ut_beta,
+                    'ut_kappa': 0.0,
+                    'ut_in_image_margin_factor': 1.5,
+                    'ut_require_all_sigma_points_valid': False,
+                    'rect_bounding': True,
+                    'tight_opacity_bounding': True,
+                    'tile_based_culling': True,
                 }
             }
-            
-            self.gut_renderer = GUT3DRenderer(gut_config)
-            print(f"[INFO] 3DGUT initialized:")
-            print(f"  - Camera model: {self.config.camera_model}")
-            print(f"  - SH degree: {sh_degree}")
-            print(f"  - K-buffer size: {self.config.k_buffer_size}")
-            print(f"  - UT params: α={self.config.ut_alpha}, β={self.config.ut_beta}")
-    
-    def get_outputs_for_camera(self, camera: Cameras) -> Dict[str, Tensor]:
-        """
-        Render camera with 3DGUT ray tracing.
+        }
+        
+        self.gut_renderer = GUT3DRenderer(config)
+        print(f"[SplatGUT] 3DGUT renderer ready (L={L}, k={self.config.k_buffer_size})")
 
-        Pipeline:
-            1) 生成射线（含可选相机优化与降采样）
-            2) 调 3DGUT 渲染
-            3) 若 3DGUT 返回“特征图”，再走 SplatAD 的解码器；否则直接用成品 RGB
-            4) 与背景合成；返回 rgb / depth / accumulation / background
+    def get_param_groups(self) -> Dict[str, list]:
         """
+        Define optimizer parameter groups.
+        
+        SplatAD uses gauss_params dict, not self.gaussians.
+        """
+        groups = super().get_param_groups()
+        
+        # Add SH high-order to sh group
+        sh_group = groups.get("sh", [])
+        
+        # Add features_dc from gauss_params
+        for key, val in self.gauss_params.items():
+            if 'features_dc' in key.lower() and val not in sh_group:
+                sh_group.append(val)
+        
+        # Add sh_high_order
+        if hasattr(self, 'sh_high_order') and self.sh_high_order not in sh_group:
+            sh_group.append(self.sh_high_order)
+        
+        groups["sh"] = sh_group
+        
+        return groups
+
+    def get_outputs_for_camera(self, camera: Cameras) -> Dict[str, Tensor]:
+        """Camera rendering: 3DGUT or gsplat."""
         if not self.config.use_ray_tracing:
             return super().get_outputs_for_camera(camera)
+        
+        return self._render_camera_with_gut(camera)
 
-        # Step 1: 相机优化 & 降采样
-        if self.training or self.config.use_camopt_in_eval:
+    def _render_camera_with_gut(self, camera: Cameras) -> Dict[str, Tensor]:
+        """Render camera with 3DGUT."""
+        # Camera optimization
+        if self.config.use_camopt_in_eval or self.training:
             camera = self.camera_optimizer.apply_to_camera(camera)
-
+        
+        # Downscaling
         scale = self._get_downscale_factor()
         if scale != 1:
             camera.rescale_output_resolution(1 / scale)
-
+        
         W, H = int(camera.width.item()), int(camera.height.item())
         c2w = camera.camera_to_worlds
-
-        # 生成射线
-        rays_o, rays_d = self._generate_camera_rays(camera, W, H, c2w)
-
-        # Step 2: 3DGUT 渲染
-        outs = self.gut_renderer.render(
+        
+        # Generate rays
+        rays_o, rays_d = self._generate_rays(camera, W, H, c2w)
+        
+        # Render with 3DGUT
+        outputs = self.gut_renderer.render(
             model=self,
             camera=camera,
             rays_o=rays_o,
             rays_d=rays_d,
             c2w=c2w,
+            target_radius=self.config.target_radius,
+            gut_sh_degree=self.config.sh_degree,
         )
-
-        feat_or_rgb = outs["rgb"]     # [H,W,3] or [H,W,C_feat]
-        alpha       = outs["alpha"]   # [H,W] or [H,W,1]
-        depth       = outs["depth"]   # [H,W] or [H,W,1]
-
-        # 规范形状
-        if alpha.ndim == 2:
-            alpha_ = alpha.unsqueeze(-1)     # -> [H,W,1]
-        else:
-            alpha_ = alpha
-        if depth.ndim == 3 and depth.shape[-1] == 1:
-            depth_ = depth.squeeze(-1)       # -> [H,W]
-        else:
-            depth_ = depth
-
-        # Step 3: 仅当 3DGUT 返回“特征图”时才调用解码器
-        if feat_or_rgb.ndim == 3 and feat_or_rgb.shape[-1] == 3:
-            rgb_fg = feat_or_rgb            # 成品前景 RGB
-        else:
-            if not hasattr(self, "rgb_decoder"):
-                raise RuntimeError(
-                    "3DGUT returned a feature map but 'rgb_decoder' is not available. "
-                    "Either enable the decoder or configure tracer to output final RGB."
-                )
-            from nerfstudio.models.splatad import get_ray_dirs_pinhole
-            ray_dirs = get_ray_dirs_pinhole(camera, W, H, c2w)
-            if ray_dirs.dim() == 3:
-                ray_dirs = ray_dirs.unsqueeze(0)                  # [1,H,W,3]
-            appearance = self._get_appearance_embedding(camera, feat_or_rgb)  # [H,W,8]
-            features   = torch.cat([feat_or_rgb, appearance], dim=-1)         # [H,W,24]
-            rgb_fg     = self.rgb_decoder(features, ray_dirs).squeeze(0)      # [H,W,3]
-
-        # Step 4: 背景合成 + 返回 background（供 metrics 使用）
-        bg = self._get_background_color()      # [3] or [H,W,3]
+        
+        # Composite
+        rgb, alpha, depth = outputs['rgb'], outputs['alpha'], outputs['depth']
+        
+        alpha = alpha.unsqueeze(-1) if alpha.ndim == 2 else alpha
+        depth = depth.squeeze(-1) if depth.ndim == 3 else depth
+        
+        bg = self._get_background_color()
         if bg.ndim == 1:
-            bg_img = bg.view(1, 1, 3).expand(H, W, 3)
-        else:
-            bg_img = bg                         # 已是 [H,W,3]
-
-        rgb = torch.clamp(rgb_fg * alpha_ + (1.0 - alpha_) * bg_img, 0.0, 1.0)
-
-        # 还原分辨率
+            bg = bg.view(1, 1, 3).expand(H, W, 3)
+        
+        rgb = torch.clamp(rgb * alpha + (1 - alpha) * bg, 0, 1)
+        
         if scale != 1:
             camera.rescale_output_resolution(scale)
-
+        
         return {
-            "rgb": rgb,                           # [H,W,3]  已与背景合成
-            "depth": depth_,                      # [H,W]
-            "accumulation": alpha_.squeeze(-1),   # [H,W]
-            "background": bg_img,                 # [H,W,3]  供 metrics 对 GT 合成使用
+            "rgb": rgb,
+            "depth": depth,
+            "accumulation": alpha.squeeze(-1),
+            "background": bg,
         }
 
-    
-    def _generate_camera_rays(self, camera, W, H, c2w):
-        """
-        Generate camera rays based on camera model.
-        
-        For pinhole: Standard perspective projection
-        For fisheye: Kannala-Brandt undistortion (if available)
-        """
+    @torch.no_grad()
+    def _generate_rays(self, camera: Cameras, W: int, H: int, 
+                       c2w: Tensor) -> tuple[Tensor, Tensor]:
+        """Generate rays (pinhole or fisheye)."""
         device = c2w.device
-        fx = camera.fx.item()
-        fy = camera.fy.item()
-        cx = camera.cx.item()
-        cy = camera.cy.item()
         
-        # Generate pixel coordinates
-        y, x = torch.meshgrid(
+        fx, fy = float(camera.fx.item()), float(camera.fy.item())
+        cx, cy = float(camera.cx.item()), float(camera.cy.item())
+        
+        yy, xx = torch.meshgrid(
             torch.arange(H, device=device, dtype=torch.float32),
             torch.arange(W, device=device, dtype=torch.float32),
             indexing='ij'
         )
         
-        # Check if fisheye
-        if self.config.camera_model == "fisheye" or (
-            self.config.camera_model == "auto" and 
-            hasattr(camera, 'distortion_params') and 
-            camera.distortion_params is not None
-        ):
-            # Use fisheye undistortion
-            rays_d = self._generate_fisheye_rays(x, y, fx, fy, cx, cy, camera, device)
-        else:
-            # Use pinhole projection
-            dirs_cam = torch.stack([
-                (x - cx) / fx,
-                (y - cy) / fy,
-                torch.ones_like(x)
-            ], dim=-1)
-            
-            # Transform to world space
-            R = c2w[0, :3, :3] if c2w.dim() == 3 else c2w[:3, :3]
-            rays_d = (dirs_cam @ R.T)
-            rays_d = rays_d / rays_d.norm(dim=-1, keepdim=True)
-        
-        # Origin (same for both)
+        R = c2w[0, :3, :3] if c2w.dim() == 3 else c2w[:3, :3]
         t = c2w[0, :3, 3] if c2w.dim() == 3 else c2w[:3, 3]
+        
+        if self.config.camera_model == "fisheye":
+            dirs_cam = self._fisheye_unproject(xx, yy, fx, fy, cx, cy, camera)
+        else:
+            dirs_cam = torch.stack([
+                (xx - cx) / fx,
+                (yy - cy) / fy,
+                torch.ones_like(xx)
+            ], dim=-1)
+        
+        rays_d = F.normalize(dirs_cam @ R.T, dim=-1)
         rays_o = t[None, None, :].expand(H, W, 3)
         
-        return rays_o, rays_d
-    
-    def _generate_fisheye_rays(self, x, y, fx, fy, cx, cy, camera, device):
-        """
-        Generate fisheye rays using Kannala-Brandt undistortion.
+        return rays_o.contiguous(), rays_d.contiguous()
+
+    def _fisheye_unproject(self, xx: Tensor, yy: Tensor,
+                          fx: float, fy: float, cx: float, cy: float,
+                          camera: Cameras) -> Tensor:
+        """Fisheye unprojection (Kannala-Brandt)."""
+        device = xx.device
         
-        Matches 3DGUT's kannala_unproject_pixels_to_rays.
-        Reference: threedgrut/datasets/utils.py
-        """
-        # Get distortion coefficients [k1, k2, k3, k4]
         if self.config.fisheye_distortion is not None:
-            k = torch.tensor(self.config.fisheye_distortion, device=device, dtype=torch.float32)
-        elif hasattr(camera, 'distortion_params'):
+            k = torch.tensor(self.config.fisheye_distortion, 
+                           device=device, dtype=torch.float32)
+        elif hasattr(camera, 'distortion_params') and camera.distortion_params is not None:
             k = camera.distortion_params.to(device).float()
         else:
-            raise ValueError("Fisheye requires distortion_params")
+            raise ValueError("Fisheye requires distortion_params [k1,k2,k3,k4]")
         
-        if len(k) < 4:
-            k = torch.cat([k, torch.zeros(4 - len(k), device=device)])
+        if k.numel() < 4:
+            k = torch.cat([k, torch.zeros(4 - k.numel(), device=device)])
         k = k[:4]
         
-        # Pixel to normalized coordinates
-        u_norm = (x - cx) / fx
-        v_norm = (y - cy) / fy
+        u, v = (xx - cx) / fx, (yy - cy) / fy
+        rho = torch.sqrt(u*u + v*v)
+        phi = torch.atan2(v, u)
         
-        # Radial distance in image plane
-        rho = torch.sqrt(u_norm**2 + v_norm**2)
-        
-        # Azimuthal angle
-        phi = torch.atan2(v_norm, u_norm)
-        
-        # Newton-Raphson iteration to solve: theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8) = rho
         theta = rho.clone()
         for _ in range(4):
-            a = k[0] * theta**2
-            b = k[1] * theta**4
-            c = k[2] * theta**6
-            d = k[3] * theta**8
-            
-            # Residual: f(theta) = theta*(1+a+b+c+d) - rho
-            residual = theta * (1 + a + b + c + d) - rho
-            
-            # Derivative: f'(theta) = 1 + 3*a + 5*b + 7*c + 9*d
-            derivative = 1 + 3*a + 5*b + 7*c + 9*d
-            
-            # Avoid division by zero
-            derivative = torch.where(
-                derivative.abs() > 1e-6,
-                derivative,
-                torch.ones_like(derivative) * 1e-6
-            )
-            
-            # Newton step
-            theta = theta - residual / derivative
+            t2, t4, t6, t8 = theta**2, theta**4, theta**6, theta**8
+            poly = 1 + k[0]*t2 + k[1]*t4 + k[2]*t6 + k[3]*t8
+            f = theta * poly - rho
+            fp = poly + theta * (2*k[0]*theta + 4*k[1]*t2 + 6*k[2]*t4 + 8*k[3]*t6)
+            fp = torch.where(fp.abs() > 1e-6, fp, torch.ones_like(fp) * 1e-6)
+            theta = theta - f / fp
         
-        # Convert spherical (theta, phi) to 3D direction in camera space
-        sin_theta = torch.sin(theta)
-        cos_theta = torch.cos(theta)
-        cos_phi = torch.cos(phi)
-        sin_phi = torch.sin(phi)
+        sin_t, cos_t = torch.sin(theta), torch.cos(theta)
+        cos_p, sin_p = torch.cos(phi), torch.sin(phi)
         
-        dirs_cam = torch.stack([
-            sin_theta * cos_phi,
-            sin_theta * sin_phi,
-            cos_theta
+        return torch.stack([
+            sin_t * cos_p,
+            sin_t * sin_p,
+            cos_t
         ], dim=-1)
-        
-        # Transform to world space
-        c2w = camera.camera_to_worlds
-        if self.training or self.config.use_camopt_in_eval:
-            c2w = self.camera_optimizer.apply_to_camera(camera).camera_to_worlds
-        
-        R = c2w[0, :3, :3] if c2w.dim() == 3 else c2w[:3, :3]
-        rays_d = (dirs_cam @ R.T)
-        rays_d = rays_d / rays_d.norm(dim=-1, keepdim=True)
-        
-        return rays_d

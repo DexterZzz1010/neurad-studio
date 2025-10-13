@@ -451,18 +451,9 @@ method_configs["neurad-scaleopt"].pipeline.model.camera_optimizer = ScaledCamera
 
 
 """
-Add SplatGUT method configurations.
-
-Append this to the existing method_configs.py file.
+SplatGUT Method Configuration.
+Add this to your existing method_configs.py file.
 """
-
-# ============================================================================
-# SplatGUT: SplatAD with 3DGUT Ray Tracing
-# ============================================================================
-
-# ============================================================================
-# SplatGUT: SplatAD with 3DGUT Ray Tracing
-# ============================================================================
 
 method_configs["splatgut"] = TrainerConfig(
     method_name="splatgut",
@@ -481,85 +472,103 @@ method_configs["splatgut"] = TrainerConfig(
         ),
         
         model=SplatGUTModelConfig(
-            # ========== 3DGUT 专属参数 ==========
-            use_ray_tracing=True,
+            max_steps=30001,
+            
+            # CRITICAL: Must match 3DGUT compilation
+            sh_degree=2,
+            target_radius=200.0,
+            
+            # Camera
             camera_model="pinhole",
             fisheye_distortion=None,
+            use_camopt_in_eval=True,
+            
+            # 3DGUT rendering
             k_buffer_size=32,
             ut_alpha=1.0,
             ut_beta=0.0,
-            
-            # ========== SplatAD 参数 (继承) ==========
-            max_steps=30001,
-            # 其他参数用默认值
         ),
     ),
     
-    # 完整复制SplatAD的optimizers (确保所有参数组都有)
+    # Optimizers
     optimizers={
         "means": {
             "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=1.6e-6,
-                max_steps=30000,
+                lr_final=1.6e-6, max_steps=30000
             ),
         },
-        "features_dc": {
+        
+        # IMPORTANT: Single 'sh' group for both dc + high_order
+        "sh": {
             "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
             "scheduler": None,
         },
-        "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),  # 注意:不除以20
-            "scheduler": None,
-        },
-        "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
-            "scheduler": None,
-        },
+        
         "scales": {
             "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
             "scheduler": None,
         },
+        
         "quats": {
             "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
             "scheduler": None,
         },
+        
+        "opacities": {
+            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+            "scheduler": None,
+        },
+        
         "camera_opt": {
             "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-7, max_steps=30000),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=5e-7, max_steps=30000
+            ),
         },
+        
         "camera_velocity_opt_linear": {
             "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+                lr_final=1e-6, max_steps=30000, 
+                warmup_steps=1000, lr_pre_warmup=0
             ),
         },
+        
         "camera_velocity_opt_angular": {
             "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=1e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+                lr_final=1e-7, max_steps=30000, 
+                warmup_steps=1000, lr_pre_warmup=0
             ),
         },
+        
         "camera_velocity_opt_time_to_center_pixel": {
             "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=1e-7, max_steps=30000, warmup_steps=10000, lr_pre_warmup=0
+                lr_final=1e-7, max_steps=30000, 
+                warmup_steps=10000, lr_pre_warmup=0
             ),
         },
+        
         "trajectory_opt": {
             "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=1e-4, max_steps=20001, warmup_steps=2500
+            ),
         },
+        
         "fields": {
             "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
-            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=1e-3, max_steps=20001, warmup_steps=500
+            ),
         },
     },
     
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
 )
-
 def _scaled_neurad_training(config: TrainerConfig, scale: float, newname: str) -> TrainerConfig:
     config = deepcopy(config)
     config.method_name = newname
