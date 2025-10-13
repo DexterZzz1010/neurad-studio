@@ -181,7 +181,7 @@ class GaussiansWrapper:
         # CRITICAL: 3DGUT default config has particle_radiance_sph_degree=3
         # Kernel is compiled with PARTICLE_RADIANCE_NUM_COEFFS=(3+1)^2=16
         # We MUST provide degree=3 features, padding if necessary
-        COMPILED_DEGREE = 3
+        COMPILED_DEGREE = 2
         self._sh_degree = COMPILED_DEGREE
         M = (COMPILED_DEGREE + 1) ** 2 - 1  # 15
         self.feature_width = 3 * (M + 1)    # 48
