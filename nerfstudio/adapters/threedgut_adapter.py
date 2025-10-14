@@ -1,10 +1,10 @@
 """
-3DGUT Adapter - Pure SH rendering interface.
+3DGUT Adapter - SplatAD → 3DGUT 转换层
 
-Design principles:
-    1. Single responsibility: Convert SplatAD → 3DGUT format
-    2. Fail-fast: Validate everything at init
-    3. No special cases: One normalization, one validation path
+设计原则（Linus style）:
+    1. Single responsibility: 只做格式转换
+    2. Fail-fast: 在 __init__ 就校验所有参数
+    3. No guessing: 显式传参，不从对象猜测
 """
 
 import numpy as np
@@ -28,7 +28,7 @@ except ImportError:
 
 
 class CamerasToBatchConverter:
-    """Convert camera parameters to 3DGUT Batch format."""
+    """相机参数 → 3DGUT Batch."""
 
     @staticmethod
     def convert(camera, c2w: Tensor, rays_o: Tensor, rays_d: Tensor,
@@ -41,39 +41,13 @@ class CamerasToBatchConverter:
         cx, cy = float(camera.cx.item()), float(camera.cy.item())
 
         if camera_model == "fisheye":
-            if distortion is None:
-                distortion = getattr(camera, 'distortion_params', None)
-                if distortion is None:
-                    raise ValueError("Fisheye requires distortion_params [k1,k2,k3,k4]")
-                if isinstance(distortion, Tensor):
-                    distortion = distortion.cpu().numpy()
-            
-            distortion = np.asarray(distortion, dtype=np.float32)
-            if len(distortion) < 4:
-                distortion = np.pad(distortion, (0, 4 - len(distortion)))
-            
-            max_angle = CamerasToBatchConverter._compute_max_angle(fx, fy, cx, cy, W, H)
-            
-            params = OpenCVFisheyeCameraModelParameters(
-                principal_point=np.array([cx, cy], dtype=np.float32),
-                focal_length=np.array([fx, fy], dtype=np.float32),
-                radial_coeffs=distortion[:4],
-                resolution=np.array([W, H], dtype=np.int64),
-                max_angle=max_angle,
-                shutter_type=ShutterType.GLOBAL,
+            params, key = CamerasToBatchConverter._build_fisheye(
+                fx, fy, cx, cy, W, H, camera, distortion
             )
-            key = "intrinsics_OpenCVFisheyeCameraModelParameters"
         else:
-            params = OpenCVPinholeCameraModelParameters(
-                resolution=np.array([W, H], dtype=np.int64),
-                shutter_type=ShutterType.GLOBAL,
-                principal_point=np.array([cx, cy], dtype=np.float32),
-                focal_length=np.array([fx, fy], dtype=np.float32),
-                radial_coeffs=np.zeros(6, dtype=np.float32),
-                tangential_coeffs=np.zeros(2, dtype=np.float32),
-                thin_prism_coeffs=np.zeros(4, dtype=np.float32),
+            params, key = CamerasToBatchConverter._build_pinhole(
+                fx, fy, cx, cy, W, H
             )
-            key = "intrinsics_OpenCVPinholeCameraModelParameters"
 
         return Batch(**{
             'rays_ori': rays_o.unsqueeze(0).contiguous(),
@@ -83,47 +57,106 @@ class CamerasToBatchConverter:
         })
 
     @staticmethod
-    def _compute_max_angle(fx, fy, cx, cy, W, H):
+    def _build_fisheye(fx, fy, cx, cy, W, H, camera, distortion):
+        if distortion is None:
+            distortion = getattr(camera, 'distortion_params', None)
+            if distortion is None:
+                raise ValueError("Fisheye requires distortion_params [k1,k2,k3,k4]")
+            if isinstance(distortion, Tensor):
+                distortion = distortion.cpu().numpy()
+        
+        distortion = np.asarray(distortion, dtype=np.float32)
+        if len(distortion) < 4:
+            distortion = np.pad(distortion, (0, 4 - len(distortion)))
+        
         max_r = np.sqrt(max(cx**2 + cy**2, (W-cx)**2 + cy**2,
                            cx**2 + (H-cy)**2, (W-cx)**2 + (H-cy)**2))
-        return float(max(2.0 * max_r / fx, 2.0 * max_r / fy) / 2.0)
+        max_angle = float(max(2.0 * max_r / fx, 2.0 * max_r / fy) / 2.0)
+        
+        params = OpenCVFisheyeCameraModelParameters(
+            principal_point=np.array([cx, cy], dtype=np.float32),
+            focal_length=np.array([fx, fy], dtype=np.float32),
+            radial_coeffs=distortion[:4],
+            resolution=np.array([W, H], dtype=np.int64),
+            max_angle=max_angle,
+            shutter_type=ShutterType.GLOBAL,
+        )
+        return params, "intrinsics_OpenCVFisheyeCameraModelParameters"
+
+    @staticmethod
+    def _build_pinhole(fx, fy, cx, cy, W, H):
+        params = OpenCVPinholeCameraModelParameters(
+            resolution=np.array([W, H], dtype=np.int64),
+            shutter_type=ShutterType.GLOBAL,
+            principal_point=np.array([cx, cy], dtype=np.float32),
+            focal_length=np.array([fx, fy], dtype=np.float32),
+            radial_coeffs=np.zeros(6, dtype=np.float32),
+            tangential_coeffs=np.zeros(2, dtype=np.float32),
+            thin_prism_coeffs=np.zeros(4, dtype=np.float32),
+        )
+        return params, "intrinsics_OpenCVPinholeCameraModelParameters"
 
 
 class GaussiansWrapper:
-    """Wrap SplatAD Gaussians for 3DGUT."""
+    """
+    从 SplatAD gauss_params 字典创建 3DGUT Gaussians.
+    
+    关键：SplatAD 用 gauss_params 字典，不是 self.gaussians 对象！
+    """
 
-    def __init__(self, model, target_radius: float, gut_sh_degree: int):
-        g = model.gaussians
+    def __init__(self, gauss_params: dict, target_radius: float, gut_sh_degree: int):
+        """
+        Args:
+            gauss_params: SplatAD 的 gauss_params 字典
+            target_radius: 归一化半径
+            gut_sh_degree: 目标 SH 度数
+        """
+        # 从字典提取参数
+        means = self._get_param(gauss_params, 'means')
+        quats = self._get_param(gauss_params, 'quats')
+        scales = self._get_param(gauss_params, 'scales')
+        opacities = self._get_param(gauss_params, 'opacities')
+        features_dc = self._get_param(gauss_params, 'features_dc')
+        features_rest = self._get_param(gauss_params, 'features_rest')
+        
         dtype = torch.float32
         
-        # Positions: normalize to sphere
-        self.positions = self._normalize_positions(g.means.to(dtype), target_radius)
+        # 位置归一化
+        self.positions = self._normalize_positions(means.to(dtype), target_radius)
         
-        # Rotations: unit quaternions
-        self.quats = F.normalize(g.quats.to(dtype), dim=-1).contiguous()
+        # 旋转归一化
+        self.quats = F.normalize(quats.to(dtype), dim=-1).contiguous()
         
-        # Scales: ensure positive
-        scales = g.scales.to(dtype)
-        if torch.any(scales < 0):
-            scales = torch.exp(scales)
-        self.scales = torch.clamp(scales, min=1e-6).contiguous()
+        # 尺度确保正数
+        scales_f = scales.to(dtype)
+        if torch.any(scales_f < 0):
+            scales_f = torch.exp(scales_f)
+        self.scales = torch.clamp(scales_f, min=1e-6).contiguous()
         
-        # Opacities: map to [0,1]
-        op = g.opacities.to(dtype)
+        # 不透明度映射到 [0,1]
+        op = opacities.to(dtype)
         if op.min() < 0 or op.max() > 1:
             op = torch.sigmoid(op)
         self.opacity = torch.clamp(op, 0, 1).contiguous()
         
-        # SH: map degree
-        dc = g.features_dc.to(dtype)
-        rest = g.features_rest.to(dtype)
+        # SH 度数映射
+        dc = features_dc.to(dtype)
+        rest = features_rest.to(dtype)
         L_src = self._infer_L(rest)
         self.sh = self._map_sh(dc, rest, L_src, gut_sh_degree)
         
-        # Validate (fail-fast)
+        # Fail-fast 校验
         self._validate()
         
         self.num_gaussians = self.positions.shape[0]
+
+    @staticmethod
+    def _get_param(params_dict: dict, key_fragment: str) -> Tensor:
+        """从字典中查找包含 key_fragment 的参数."""
+        for k, v in params_dict.items():
+            if key_fragment.lower() in k.lower():
+                return v
+        raise KeyError(f"Cannot find '{key_fragment}' in gauss_params keys: {list(params_dict.keys())}")
 
     @staticmethod
     def _normalize_positions(means: Tensor, target_radius: float) -> Tensor:
@@ -135,16 +168,14 @@ class GaussiansWrapper:
         radius = max(radius, centered.abs().max().item() * 0.5, 1e-6)
         
         normalized = centered * (target_radius / radius)
-        normalized = torch.clamp(normalized, -2*target_radius, 2*target_radius)
-        
-        return normalized.contiguous()
+        return torch.clamp(normalized, -2*target_radius, 2*target_radius).contiguous()
 
     @staticmethod
     def _infer_L(features_rest: Tensor) -> int:
         M = features_rest.shape[-1] + 1
         L = int(M ** 0.5) - 1
         if (L + 1) ** 2 != M:
-            raise ValueError(f"features_rest dim {M-1} invalid")
+            raise ValueError(f"features_rest dim {M-1} invalid (expected (L+1)^2-1)")
         return L
 
     @staticmethod
@@ -181,35 +212,43 @@ class GaussiansWrapper:
 
 
 class GUT3DRenderer:
-    """Thin wrapper around threedgut_tracer.Tracer."""
+    """3DGUT 渲染器封装."""
 
     def __init__(self, config: dict):
         if not THREEDGUT_AVAILABLE:
-            raise ImportError("threedgut not available. Install: pip install threedgut")
+            raise ImportError("threedgut not available")
         
         from omegaconf import OmegaConf
         self.tracer = threedgut_tracer.Tracer(OmegaConf.create(config))
 
-    def render(self, model, camera, rays_o: Tensor, rays_d: Tensor, c2w: Tensor,
-               target_radius: float, gut_sh_degree: int) -> Dict[str, Tensor]:
-        # Wrap Gaussians
-        gaussians = GaussiansWrapper(model, target_radius, gut_sh_degree)
+    def render(self, gauss_params: dict, camera, rays_o: Tensor, rays_d: Tensor, 
+               c2w: Tensor, target_radius: float, gut_sh_degree: int,
+               camera_model: str, distortion: Optional[np.ndarray], 
+               training: bool) -> Dict[str, Tensor]:
+        """
+        渲染接口.
         
-        # Get distortion if fisheye
-        distortion = None
-        if hasattr(model.config, 'fisheye_distortion'):
-            dist = model.config.fisheye_distortion
-            if dist is not None:
-                distortion = np.array(dist, dtype=np.float32)
+        Args:
+            gauss_params: SplatAD 的 gauss_params 字典
+            camera: nerfstudio Camera
+            rays_o, rays_d: [H,W,3] 射线
+            c2w: [3,4] 或 [1,3,4] 相机姿态
+            target_radius: 归一化半径
+            gut_sh_degree: SH 度数
+            camera_model: 'pinhole' 或 'fisheye'
+            distortion: 鱼眼畸变系数
+            training: 训练模式
+        """
+        # 包装 Gaussians
+        gaussians = GaussiansWrapper(gauss_params, target_radius, gut_sh_degree)
         
-        # Convert camera
-        camera_model = getattr(model.config, "camera_model", "pinhole")
+        # 转换相机
         batch = CamerasToBatchConverter.convert(
             camera, c2w, rays_o, rays_d, camera_model, distortion
         )
         
-        # Render
-        outputs = self.tracer.render(gaussians, batch, train=model.training)
+        # 渲染
+        outputs = self.tracer.render(gaussians, batch, train=training)
         
         return {
             'rgb': outputs['pred_rgb'].squeeze(0),
