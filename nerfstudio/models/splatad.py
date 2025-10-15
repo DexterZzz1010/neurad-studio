@@ -796,7 +796,9 @@ class SplatADModel(ADModel):
         self.camera_velocity_optimizer.get_param_groups(param_groups=param_groups)
         param_groups["fields"] = []
 
-        param_groups["fields"] += list(self.rgb_decoder.parameters())
+        # 修改后: 检查是否为 None
+        if self.rgb_decoder is not None:
+            param_groups["fields"] += list(self.rgb_decoder.parameters())
         param_groups["fields"] += list(self.appearance_embedding.parameters())
 
         param_groups["fields"] += list(self.lidar_decoder.parameters())

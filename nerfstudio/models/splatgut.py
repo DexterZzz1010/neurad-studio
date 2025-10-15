@@ -1,13 +1,14 @@
 """
-SplatGUT: 相机用独立 SH，LiDAR 用 features + decoder
+SplatGUT: 相机用独立 SH + 3DGUT，LiDAR 用 features + decoder
 
-设计：
-    1. Camera: 新 SH 参数 → 3DGUT → RGB (无 decoder)
-    2. LiDAR: 原 features → decoder → intensity/ray_drop (继承父类)
+Good Taste（Linus 认证 + Debug 版本）:
+    1. 单一渲染路径：Camera → rays → 3DGUT
+    2. RayBundle 只是"查找 Camera"的线索
+    3. 详细 debug 信息追踪问题
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Type
+from typing import Dict, Optional, Type, Union
 
 import torch
 import torch.nn as nn
@@ -16,10 +17,12 @@ from torch import Tensor
 
 from nerfstudio.models.splatad import SplatADModel, SplatADModelConfig
 from nerfstudio.cameras.cameras import Cameras
-
+from nerfstudio.cameras.lidars import Lidars
+from nerfstudio.cameras.rays import RayBundle
 
 @dataclass
 class SplatGUTModelConfig(SplatADModelConfig):
+    """SplatGUT 配置."""
     _target: Type = field(default_factory=lambda: SplatGUTModel)
 
     use_ray_tracing: bool = True
@@ -34,25 +37,26 @@ class SplatGUTModelConfig(SplatADModelConfig):
 
 
 class SplatGUTModel(SplatADModel):
+    """SplatGUT: 相机用 SH + 3DGUT."""
+    
     config: SplatGUTModelConfig
 
     def populate_modules(self):
-        """初始化：父类 → 创建独立 SH → 禁用相机 decoder → 初始化 3DGUT."""
+        """初始化."""
         super().populate_modules()
         
-        # 创建独立 SH（不动原 features）
         self._create_independent_sh()
-        
-        # 禁用相机 decoder（LiDAR decoder 保留）
         self._disable_camera_decoder()
         
-        # 初始化 3DGUT
         if self.config.use_ray_tracing:
             self._init_gut_renderer()
+        
+        # 惰性初始化
+        self.train_cameras = None
+        self._train_cameras_extracted = False
 
     def _create_independent_sh(self):
-        """创建独立 SH 参数（不影响 gauss_params 中的 features）."""
-        # 获取 Gaussian 数量
+        """创建独立 SH."""
         means = None
         for key, val in self.gauss_params.items():
             if 'means' in key.lower():
@@ -62,45 +66,22 @@ class SplatGUTModel(SplatADModel):
         if means is None:
             raise RuntimeError("Cannot find 'means' in gauss_params")
         
-        N = means.shape[0]
-        device = means.device
-        dtype = means.dtype
+        N, device, dtype = means.shape[0], means.device, means.dtype
+        L, M = self.config.sh_degree, (self.config.sh_degree + 1) ** 2
         
-        L = self.config.sh_degree
-        M = (L + 1) ** 2
+        self.sh_coeffs_dc = nn.Parameter(torch.zeros(N, 3, 1, device=device, dtype=dtype))
+        self.sh_coeffs_rest = nn.Parameter(torch.zeros(N, 3, M - 1, device=device, dtype=dtype))
         
-        # 创建独立 SH（RGB × SH 系数）
-        self.sh_coeffs_dc = nn.Parameter(
-            torch.zeros(N, 3, 1, device=device, dtype=dtype)
-        )
-        self.sh_coeffs_rest = nn.Parameter(
-            torch.zeros(N, 3, M - 1, device=device, dtype=dtype)
-        )
-        
-        print(f"[SplatGUT] Created independent SH: N={N}, L={L}, M={M}")
-        print(f"  sh_coeffs_dc: {tuple(self.sh_coeffs_dc.shape)}")
-        print(f"  sh_coeffs_rest: {tuple(self.sh_coeffs_rest.shape)}")
-        print(f"  Original features_dc (for LiDAR): {self.gauss_params['features_dc'].shape}")
-        print(f"  Original features_rest (for LiDAR): {self.gauss_params['features_rest'].shape}")
+        print(f"[SplatGUT] Created independent SH: N={N}, L={L}")
 
     def _disable_camera_decoder(self):
-        """
-        禁用相机 decoder（保留 LiDAR decoder）.
-        
-        注意：只禁用 rgb_decoder 和 appearance_embedding，
-              lidar_decoder 保留用于 LiDAR 渲染。
-        """
+        """禁用相机 decoder."""
         if hasattr(self, 'rgb_decoder'):
-            self.rgb_decoder = None
-            print("[SplatGUT] Disabled rgb_decoder (camera will use SH)")
+            self.rgb_decoder = nn.Identity()
+            print("[SplatGUT] Disabled rgb_decoder")
         
-        if hasattr(self, 'appearance_embedding'):
-            self.appearance_embedding = None
-            print("[SplatGUT] Disabled appearance_embedding")
-        
-        # 保留 lidar_decoder
-        if hasattr(self, 'lidar_decoder'):
-            print("[SplatGUT] Kept lidar_decoder (LiDAR uses features)")
+        # if hasattr(self, 'appearance_embedding'):
+        #     self.appearance_embedding = nn.Identity()
 
     def _init_gut_renderer(self):
         """初始化 3DGUT."""
@@ -112,15 +93,13 @@ class SplatGUTModel(SplatADModel):
             return
         
         if not THREEDGUT_AVAILABLE:
-            print("[SplatGUT] 3DGUT not available")
             self.config.use_ray_tracing = False
             return
         
-        L = self.config.sh_degree
         gut_config = {
             'render': {
                 'method': '3dgut',
-                'particle_radiance_sph_degree': L,
+                'particle_radiance_sph_degree': self.config.sh_degree,
                 'particle_kernel_degree': 2,
                 'particle_kernel_min_response': 0.0,
                 'particle_kernel_min_alpha': 0.0,
@@ -144,84 +123,156 @@ class SplatGUTModel(SplatADModel):
         }
         
         self.gut_renderer = GUT3DRenderer(gut_config)
-        print(f"[SplatGUT] 3DGUT ready: L={L}, k={self.config.k_buffer_size}")
+        print(f"[SplatGUT] 3DGUT ready")
 
-    def get_param_groups(self) -> Dict[str, list]:
+    def get_outputs(self, sensor: Union[RayBundle, Cameras, Lidars]) -> Dict[str, Tensor]:
         """
-        优化器参数组：移除原 features，添加独立 SH.
-        
-        关键：
-            - 移除 features_dc/features_rest（它们现在只用于 LiDAR）
-            - 添加 sh_coeffs_dc/sh_coeffs_rest（用于相机）
+        主入口 + DEBUG.
         """
-        groups = super().get_param_groups()
+        # # DEBUG: 详细类型信息
+        # print(f"\n[DEBUG] ========== get_outputs called ==========")
+        # print(f"[DEBUG] sensor type: {type(sensor)}")
+        # print(f"[DEBUG] sensor.__class__: {sensor.__class__}")
+        # print(f"[DEBUG] sensor.__class__.__name__: {sensor.__class__.__name__}")
+        # print(f"[DEBUG] sensor.__class__.__module__: {sensor.__class__.__module__}")
+        # print(f"[DEBUG] isinstance(sensor, RayBundle): {isinstance(sensor, RayBundle)}")
+        # print(f"[DEBUG] isinstance(sensor, Cameras): {isinstance(sensor, Cameras)}")
+        # print(f"[DEBUG] isinstance(sensor, Lidars): {isinstance(sensor, Lidars)}")
+        # print(f"[DEBUG] RayBundle class: {RayBundle}")
+        # print(f"[DEBUG] Cameras class: {Cameras}")
         
-        # 移除原来的 features_dc 和 features_rest
-        # （它们在父类中可能被添加到 'sh' 或其他组）
-        for group_name in list(groups.keys()):
-            if group_name in ['features_dc', 'features_rest', 'sh']:
-                # 过滤掉来自 gauss_params 的 features
-                filtered = []
-                for param in groups[group_name]:
-                    param_id = id(param)
-                    # 检查是否是 gauss_params 中的 features
-                    is_gauss_feature = False
-                    for key, val in self.gauss_params.items():
-                        if 'features' in key.lower() and id(val) == param_id:
-                            is_gauss_feature = True
-                            break
-                    
-                    if not is_gauss_feature:
-                        filtered.append(param)
-                
-                if filtered:
-                    groups[group_name] = filtered
-                else:
-                    del groups[group_name]
+        # LiDAR → 父类
+        if isinstance(sensor, Lidars):
+            print("[DEBUG] → Lidars branch")
+            return super().get_outputs(sensor)
         
-        # 添加独立 SH
-        sh_group = []
-        if hasattr(self, 'sh_coeffs_dc'):
-            sh_group.append(self.sh_coeffs_dc)
-        if hasattr(self, 'sh_coeffs_rest'):
-            sh_group.append(self.sh_coeffs_rest)
+        # 相机路径
+        if self.config.use_ray_tracing:
+            if isinstance(sensor, RayBundle):
+                # 训练：提取 camera_idx
+                # print("[DEBUG] → RayBundle branch (TRAINING)")
+                cam_idx = self._extract_camera_idx_from_raybundle(sensor)
+                # print(f"[DEBUG] Extracted cam_idx: {cam_idx}")
+                return self._render_camera_with_gut(cam_idx)
+            
+            elif isinstance(sensor, Cameras):
+                # 评估：直接用 Cameras
+                # print("[DEBUG] → Cameras branch (EVAL)")
+                return self._render_camera_with_gut(sensor)
         
-        if sh_group:
-            groups["sh"] = sh_group
-        
-        return groups
+        # 回退
+        # print("[DEBUG] → Fallback to parent")
+        return super().get_outputs(sensor)
 
-    def get_outputs_for_camera(self, camera: Cameras) -> Dict[str, Tensor]:
-        """相机渲染：使用独立 SH."""
-        if not self.config.use_ray_tracing:
-            return super().get_outputs_for_camera(camera)
+    def _extract_camera_idx_from_raybundle(self, ray_bundle: RayBundle) -> int:
+        """从 RayBundle 提取 camera_idx."""
+        if ray_bundle.camera_indices is None:
+            raise ValueError("RayBundle must have camera_indices")
         
-        # 相机优化
-        if self.training or self.config.use_camopt_in_eval:
-            camera = self.camera_optimizer.apply_to_camera(camera)
+        cam_idx = int(ray_bundle.camera_indices.flatten()[0].item())
+        # print(f"[DEBUG] _extract_camera_idx_from_raybundle: cam_idx={cam_idx}")
         
-        # 降采样
+        # 惰性初始化训练相机
+        if not self._train_cameras_extracted:
+            self._extract_train_cameras()
+        
+        # 检查索引有效性
+        if self.train_cameras is None or cam_idx >= len(self.train_cameras):
+            raise RuntimeError(
+                f"Camera {cam_idx} not found. "
+                f"train_cameras has {len(self.train_cameras) if self.train_cameras else 0} cameras."
+            )
+        
+        return cam_idx
+
+    def _extract_train_cameras(self):
+        """惰性提取训练相机."""
+        print("[DEBUG] _extract_train_cameras called")
+        print(f"[DEBUG] self.kwargs keys: {list(self.kwargs.keys())}")
+        
+        if 'train_dataset' in self.kwargs:
+            dataset = self.kwargs['train_dataset']
+            print(f"[DEBUG] Found train_dataset: {type(dataset)}")
+            print(f"[DEBUG] train_dataset attributes: {dir(dataset)}")
+            
+            if hasattr(dataset, 'cameras'):
+                self.train_cameras = dataset.cameras
+                # print(f"[DEBUG] train_cameras type: {type(self.train_cameras)}")
+                # print(f"[DEBUG] train_cameras length: {len(self.train_cameras)}")
+                # print(f"[DEBUG] train_cameras class: {self.train_cameras.__class__}")
+                self._train_cameras_extracted = True
+                return
+        
+        raise RuntimeError(
+            "[SplatGUT] Cannot find training cameras!\n"
+            "\n"
+            "Solution: Modify Pipeline:\n"
+            "    self._model = config.model.setup(..., train_dataset=self.datamanager.train_dataset)\n"
+        )
+
+    def _render_camera_with_gut(self, camera_or_idx: Union[Cameras, int]) -> Dict[str, Tensor]:
+        """统一渲染路径 + DEBUG."""
+        # print(f"\n[DEBUG] ========== _render_camera_with_gut called ==========")
+        # print(f"[DEBUG] camera_or_idx type: {type(camera_or_idx)}")
+        # print(f"[DEBUG] isinstance(camera_or_idx, int): {isinstance(camera_or_idx, int)}")
+        
+        # Step 1: 获取 Camera 对象
+        if isinstance(camera_or_idx, int):
+            # 训练：从索引获取 Camera
+            print(f"[DEBUG] Getting camera from index {camera_or_idx}")
+            print(f"[DEBUG] self.train_cameras type: {type(self.train_cameras)}")
+            
+            # 尝试不同的索引方式
+            print(f"[DEBUG] Trying self.train_cameras[{camera_or_idx}]...")
+            camera_attempt1 = self.train_cameras[camera_or_idx]
+            print(f"[DEBUG] Result type: {type(camera_attempt1)}")
+            
+            print(f"[DEBUG] Trying self.train_cameras[{camera_or_idx}:{camera_or_idx+1}]...")
+            camera_attempt2 = self.train_cameras[camera_or_idx:camera_or_idx+1]
+            print(f"[DEBUG] Result type: {type(camera_attempt2)}")
+            
+            # 使用切片方式（正确的方式！）
+            camera = self.train_cameras[camera_or_idx:camera_or_idx+1]
+            camera = camera.to(self.device)
+            print(f"[DEBUG] Final camera type: {type(camera)}")
+        else:
+            # 评估：直接用传入的 Cameras
+            print(f"[DEBUG] Using passed Cameras object")
+            camera = camera_or_idx
+        
+        # print(f"[DEBUG] camera type before optimization: {type(camera)}")
+        # print(f"[DEBUG] camera.__class__: {camera.__class__}")
+        
+        # # Step 2: 应用相机优化
+        # if self.training or self.config.use_camopt_in_eval:
+        #     camera = camera.camera_to_worlds
+        #     print(f"[DEBUG] camera type after optimization: {type(camera)}")
+        
+        # Step 3: 降采样
         scale = self._get_downscale_factor()
+        print(f"[DEBUG] downscale_factor: {scale}")
+        
         if scale != 1:
+            # print(f"[DEBUG] Rescaling with factor {1/scale}")
+            # print(f"[DEBUG] camera has rescale_output_resolution? {hasattr(camera, 'rescale_output_resolution')}")
             camera.rescale_output_resolution(1 / scale)
         
         W, H = int(camera.width.item()), int(camera.height.item())
         c2w = camera.camera_to_worlds
         
-        # 生成射线
+        # print(f"[DEBUG] W={W}, H={H}")
+        # print(f"[DEBUG] c2w shape: {c2w.shape}")
+        
+        # Step 4: 生成射线
         rays_o, rays_d = self._generate_rays(camera, W, H, c2w)
         
-        # 构建临时 gauss_params（用我们的 SH 替换 features）
+        # Step 5: 构建 gauss_params（用 SH 替换 features）
         gauss_params_sh = self._build_gauss_params_with_sh()
         
-        # 3DGUT 渲染
+        # Step 6: 3DGUT 渲染
         distortion = None
-        if self.config.fisheye_distortion is not None:
-            distortion = torch.tensor(
-                self.config.fisheye_distortion, 
-                device=rays_o.device, 
-                dtype=torch.float32
-            ).cpu().numpy()
+        if hasattr(camera, 'distortion_params') and camera.distortion_params is not None:
+            distortion = camera.distortion_params.cpu().numpy()
         
         outputs = self.gut_renderer.render(
             gauss_params=gauss_params_sh,
@@ -235,49 +286,34 @@ class SplatGUTModel(SplatADModel):
             distortion=distortion,
             training=self.training,
         )
-        
-        # 合成背景
-        rgb, alpha, depth = outputs['rgb'], outputs['alpha'], outputs['depth']
-        
-        alpha = alpha.unsqueeze(-1) if alpha.ndim == 2 else alpha
-        depth = depth.squeeze(-1) if depth.ndim == 3 else depth
-        
-        bg = self._get_background_color()
-        if bg.ndim == 1:
-            bg = bg.view(1, 1, 3).expand(H, W, 3)
-        
-        rgb = torch.clamp(rgb * alpha + (1 - alpha) * bg, 0, 1)
-        
+
+        # ====== 补齐 SplatAD 需要的 self.info（新增） ======
+        depth_t = outputs["depth"]
+        alpha_t = outputs["alpha"]
+        if alpha_t.ndim == 2:
+            alpha_t = alpha_t.unsqueeze(-1)
+        if depth_t.ndim == 2:
+            depth_t = depth_t.unsqueeze(-1)
+        # 语义对齐的近似：已“实心”(alpha>0.5) 像素用其深度作为中位深度，其余置0
+        median_depths = torch.where(alpha_t > 0.5, depth_t, torch.zeros_like(depth_t))
+
+        self.info = {
+            "height": torch.tensor(H, device=depth_t.device),
+            "width":  torch.tensor(W, device=depth_t.device),
+            "median_depths": median_depths,  # [H, W, 1]
+        }
+        # ===============================================
+
+        # Step 7: 还原分辨率
         if scale != 1:
             camera.rescale_output_resolution(scale)
         
-        return {
-            "rgb": rgb,
-            "depth": depth,
-            "accumulation": alpha.squeeze(-1),
-            "background": bg,
-        }
+        # Step 8: 后处理
+        return self._postprocess_outputs(outputs, H, W)
 
-    def _build_gauss_params_with_sh(self) -> dict:
-        """构建临时 gauss_params（用 SH 替换 features）."""
-        gauss_params_sh = {}
-        
-        # 复制所有参数（except features）
-        for key, val in self.gauss_params.items():
-            if 'features' not in key.lower():
-                gauss_params_sh[key] = val
-        
-        # 添加我们的 SH（用 features 的键名，但值是 SH）
-        gauss_params_sh['features_dc'] = self.sh_coeffs_dc
-        gauss_params_sh['features_rest'] = self.sh_coeffs_rest
-        
-        return gauss_params_sh
-
-    @torch.no_grad()
-    def _generate_rays(self, camera: Cameras, W: int, H: int, c2w: Tensor):
-        """生成射线（pinhole/fisheye）."""
+    def _generate_rays(self, camera: Cameras, W: int, H: int, c2w: Tensor) -> tuple:
+        """生成射线."""
         device = c2w.device
-        
         fx, fy = float(camera.fx.item()), float(camera.fy.item())
         cx, cy = float(camera.cx.item()), float(camera.cy.item())
         
@@ -315,13 +351,13 @@ class SplatGUTModel(SplatADModel):
         """Kannala-Brandt 鱼眼反投影."""
         if self.config.fisheye_distortion is not None:
             k = torch.tensor(self.config.fisheye_distortion, device=device, dtype=torch.float32)
-        elif hasattr(camera, 'distortion_params') and camera.distortion_params is not None:
+        elif hasattr(camera, 'distortion_params'):
             k = camera.distortion_params.to(device).float()
         else:
-            raise ValueError("Fisheye requires distortion_params [k1,k2,k3,k4]")
+            raise ValueError("Fisheye requires distortion_params")
         
-        if k.numel() < 4:
-            k = torch.cat([k, torch.zeros(4 - k.numel(), device=device)])
+        if len(k) < 4:
+            k = torch.cat([k, torch.zeros(4 - len(k), device=device)])
         k = k[:4]
         
         u, v = (xx - cx) / fx, (yy - cy) / fy
@@ -341,3 +377,76 @@ class SplatGUTModel(SplatADModel):
         cos_p, sin_p = torch.cos(phi), torch.sin(phi)
         
         return torch.stack([sin_t * cos_p, sin_t * sin_p, cos_t], dim=-1)
+
+    def _build_gauss_params_with_sh(self) -> dict:
+        """构建 gauss_params（用 SH 替换 features）."""
+        gauss_params_sh = {}
+        
+        for key, val in self.gauss_params.items():
+            if 'features' not in key.lower():
+                gauss_params_sh[key] = val
+        
+        gauss_params_sh['features_dc'] = self.sh_coeffs_dc
+        gauss_params_sh['features_rest'] = self.sh_coeffs_rest
+        
+        return gauss_params_sh
+
+    def _postprocess_outputs(self, outputs: dict, H: int, W: int) -> Dict[str, Tensor]:
+        """后处理."""
+        rgb, alpha, depth = outputs['rgb'], outputs['alpha'], outputs['depth']
+        
+        alpha = alpha.unsqueeze(-1) if alpha.ndim == 2 else alpha
+        depth = depth.squeeze(-1) if depth.ndim == 3 else depth
+        
+        bg = self._get_background_color()
+        if bg.ndim == 1:
+            bg = bg.view(1, 1, 3).expand(H, W, 3)
+        
+        rgb = torch.clamp(rgb * alpha + (1 - alpha) * bg, 0, 1)
+        
+        return {
+            "rgb": rgb,
+            "depth": depth,
+            "accumulation": alpha.squeeze(-1),
+            "background": bg,
+        }
+
+    def get_param_groups(self) -> Dict[str, list]:
+        """优化器参数组."""
+        groups = super().get_param_groups()
+        
+        for group_name in list(groups.keys()):
+            if group_name in ['features_dc', 'features_rest', 'sh', 'fields']:
+                filtered = [
+                    p for p in groups[group_name]
+                    if p is not None and not any(
+                        id(p) == id(v) for k, v in self.gauss_params.items()
+                        if v is not None and 'features' in k.lower()
+                    )
+                ]
+                
+                if filtered:
+                    groups[group_name] = filtered
+                else:
+                    del groups[group_name]
+        
+        sh_group = []
+        if hasattr(self, 'sh_coeffs_dc'):
+            sh_group.append(self.sh_coeffs_dc)
+        if hasattr(self, 'sh_coeffs_rest'):
+            sh_group.append(self.sh_coeffs_rest)
+        
+        if sh_group:
+            groups["sh"] = sh_group
+        
+        return groups
+
+    def _get_background_color(self) -> Tensor:
+        if hasattr(super(), '_get_background_color'):
+            return super()._get_background_color()
+        return torch.ones(3, device=self.sh_coeffs_dc.device)
+
+    def _get_downscale_factor(self) -> float:
+        if hasattr(super(), '_get_downscale_factor'):
+            return super()._get_downscale_factor()
+        return 1.0
