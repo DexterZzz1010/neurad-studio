@@ -485,7 +485,7 @@ method_configs["splatgut"] = TrainerConfig(
             use_ray_tracing=True,
             camera_model="pinhole",
             fisheye_distortion=None,
-            k_buffer_size=32,
+            k_buffer_size=4,
             ut_alpha=1.0,
             ut_beta=0.0,
             

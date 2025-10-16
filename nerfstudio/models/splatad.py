@@ -809,7 +809,7 @@ class SplatADModel(ADModel):
                 0,
             )
         else:
-            return 1
+            return 4
 
     def _downscale_if_required(self, image):
         d = self._get_downscale_factor()
@@ -1230,6 +1230,37 @@ class SplatADModel(ADModel):
         return out  # type: ignore
 
     def get_outputs(self, sensor: Union[Cameras, Lidars]) -> Dict[str, Union[torch.Tensor, List]]:
+        if self.training and hasattr(self, 'means'):
+            # 使用step属性（如果有）或创建计数器
+            current_step = getattr(self, 'step', 0)
+            
+            # 每100步打印一次
+            if not hasattr(self, '_last_means_check'):
+                self._last_means_check = 0
+            
+            if current_step - self._last_means_check >= 100:
+                means_min = self.means.min().item()
+                means_max = self.means.max().item()
+                means_range = means_max - means_min
+                
+                print(f"\n[Step {current_step}] Gaussians Status:")
+                print(f"  Positions: [{means_min:.2f}, {means_max:.2f}] (range={means_range:.2e})")
+                print(f"  Num points: {self.means.shape[0]}")
+                
+                # 检查异常
+                nan_count = torch.isnan(self.means).any(dim=-1).sum().item()
+                inf_count = torch.isinf(self.means).any(dim=-1).sum().item()
+                if nan_count > 0 or inf_count > 0:
+                    print(f"  ⚠️ WARNING: {nan_count} NaN, {inf_count} Inf positions!")
+                
+                # 检查scales也很重要
+                if hasattr(self, 'scales'):
+                    scales_min = self.scales.min().item()
+                    scales_max = self.scales.max().item()
+                    print(f"  Scales: [{scales_min:.2f}, {scales_max:.2f}]")
+                
+                self._last_means_check = current_step       
+       
         if isinstance(sensor, Cameras):
             return self.get_camera_outputs(sensor)
         elif isinstance(sensor, Lidars):

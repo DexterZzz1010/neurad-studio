@@ -128,18 +128,18 @@ class GaussiansWrapper:
         means_min = raw_means.min().item()
         means_max = raw_means.max().item()
         means_range = means_max - means_min
-        print(f"[GaussiansWrapper] Raw position range: [{means_min:.2f}, {means_max:.2f}] (span={means_range:.2f})")
+        # print(f"[GaussiansWrapper] Raw position range: [{means_min:.2f}, {means_max:.2f}] (span={means_range:.2f})")
         
-        if means_range > 1e7:
-            print(f"⚠️  WARNING: Extremely large position range ({means_range:.2e})!")
-            print(f"    This suggests numerical issues upstream. Proceeding with normalization...")
+        # if means_range > 1e7:
+        #     print(f"⚠️  WARNING: Extremely large position range ({means_range:.2e})!")
+        #     print(f"    This suggests numerical issues upstream. Proceeding with normalization...")
         
         self.positions, self.normalization_center, self.normalization_scale = \
             self._normalize_positions_to_radius(raw_means, target_radius)
         
         pos_min = self.positions.min().item()
         pos_max = self.positions.max().item()
-        print(f"[GaussiansWrapper] Normalized position range: [{pos_min:.2f}, {pos_max:.2f}]")
+        # print(f"[GaussiansWrapper] Normalized position range: [{pos_min:.2f}, {pos_max:.2f}]")
         
         assert self.positions.device == device and self.positions.dtype == dtype
         assert self.positions.is_contiguous()
@@ -153,8 +153,8 @@ class GaussiansWrapper:
 
         log_scale = model.scales.to(dtype=dtype, device=device)
         log_scale_clamped = torch.clamp(log_scale, min=-10, max=5)
-        if (log_scale != log_scale_clamped).any():
-            print(f"⚠️  WARNING: Clamped {(log_scale != log_scale_clamped).sum()} scale values")
+        # if (log_scale != log_scale_clamped).any():
+        #     print(f"⚠️  WARNING: Clamped {(log_scale != log_scale_clamped).sum()} scale values")
         scl = torch.exp(log_scale_clamped)
         assert torch.isfinite(scl).all() and (scl > 0).all()
         self.scale = scl.contiguous()
@@ -185,11 +185,13 @@ class GaussiansWrapper:
         self._sh_degree = COMPILED_DEGREE
         M = (COMPILED_DEGREE + 1) ** 2 - 1  # 15
         self.feature_width = 3 * (M + 1)    # 48
-        self.n_active_features = COMPILED_DEGREE  # 3 (for tracer API)
-        
-        print(f"[GaussiansWrapper] Forcing SH degree={COMPILED_DEGREE} to match compiled kernel")
-        print(f"[GaussiansWrapper] Required feature width: {self.feature_width} (actual K: {actual_K})")
-        
+
+        # 关键修复：n_active_features是系数数量，不是degree！
+        self.n_active_features = (COMPILED_DEGREE + 1) ** 2  # 16，不是3！
+
+        # print(f"[GaussiansWrapper] Forcing SH degree={COMPILED_DEGREE}")
+        # print(f"[GaussiansWrapper] SH coefficients per channel: {self.n_active_features}")
+        # print(f"[GaussiansWrapper] Total feature width: {self.feature_width}")   
         # Build projection matrix W: [actual_K, 3*M] = [K, 45]
         if not hasattr(model, "_adaptor_W_cache"):
             model._adaptor_W_cache = {}
@@ -201,7 +203,7 @@ class GaussiansWrapper:
             torch.nn.init.orthogonal_(W, gain=1.0)
             W *= (1.0 / max(1, actual_K))
             model._adaptor_W_cache[cache_key] = W
-            print(f"[GaussiansWrapper] Created projection W: {tuple(W.shape)} on {W.device}")
+            # print(f"[GaussiansWrapper] Created projection W: {tuple(W.shape)} on {W.device}")
         
         assert W.device == device, f"W device {W.device} != target {device}"
         self._W = W
@@ -287,9 +289,22 @@ class GUT3DRenderer:
         from omegaconf import OmegaConf
         self.tracer = threedgut_tracer.Tracer(OmegaConf.create(config))
         self._first_render = True
+        self._gaussians_cache = None  # 缓存
+        self._cache_generation = -1    # 缓存版本号
 
     def render(self, model, camera, rays_o, rays_d, c2w) -> Dict[str, Tensor]:
-        gaussians = GaussiansWrapper(model)
+        # 检查是否需要更新缓存
+        current_gen = getattr(model, '_generation', 0)  # 假设model有代数标记
+        
+        if self._gaussians_cache is None or self._cache_generation != current_gen:
+            print(f"[GUT3DRenderer] Creating/updating GaussiansWrapper (gen {current_gen})")
+            self._gaussians_cache = GaussiansWrapper(model)
+            self._cache_generation = current_gen
+        else:
+            # 重用缓存的wrapper
+            pass
+        
+        gaussians = self._gaussians_cache
 
         if self._first_render:
             print("\n" + "="*70)

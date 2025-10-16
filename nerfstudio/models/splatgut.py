@@ -46,6 +46,8 @@ class SplatGUTModelConfig(SplatADModelConfig):
     ut_beta: float = 0.0
     """Unscented Transform kurtosis parameter (default: 0.0)."""
 
+    """Config of the camera velocity optimizer to use"""
+    feature_dim: int = 45
 
 class SplatGUTModel(SplatADModel):
     """
