@@ -475,7 +475,7 @@ method_configs["splatgut"] = TrainerConfig(
             max_steps=30001,
             
             # CRITICAL: Must match 3DGUT compilation
-            sh_degree=2,
+            sh_degree=3,
             target_radius=200.0,
             
             # Camera
@@ -484,7 +484,7 @@ method_configs["splatgut"] = TrainerConfig(
             use_camopt_in_eval=True,
             
             # 3DGUT rendering
-            k_buffer_size=32,
+            k_buffer_size=8,
             ut_alpha=1.0,
             ut_beta=0.0,
         ),
