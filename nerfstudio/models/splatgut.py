@@ -45,7 +45,7 @@ class SplatGUTModel(SplatADModel):
         """初始化."""
         super().populate_modules()
         
-        self._create_independent_sh()
+        self._init_independent_sh()  # ← 改名
         self._disable_camera_decoder()
         
         if self.config.use_ray_tracing:
@@ -55,24 +55,23 @@ class SplatGUTModel(SplatADModel):
         self.train_cameras = None
         self._train_cameras_extracted = False
 
-    def _create_independent_sh(self):
-        """创建独立 SH."""
-        means = None
-        for key, val in self.gauss_params.items():
-            if 'means' in key.lower():
-                means = val
-                break
-        
-        if means is None:
-            raise RuntimeError("Cannot find 'means' in gauss_params")
+    def _init_independent_sh(self):
+        """初始化独立 SH - 第一次."""
+        means = self.gauss_params['means']  # ← 直接访问，不用循环
         
         N, device, dtype = means.shape[0], means.device, means.dtype
-        L, M = self.config.sh_degree, (self.config.sh_degree + 1) ** 2
+        L = self.config.sh_degree
+        M = (L + 1) ** 2
         
-        self.sh_coeffs_dc = nn.Parameter(torch.zeros(N, 3, 1, device=device, dtype=dtype))
-        self.sh_coeffs_rest = nn.Parameter(torch.zeros(N, 3, M - 1, device=device, dtype=dtype))
+        self.sh_coeffs_dc = nn.Parameter(
+            torch.zeros(N, 3, 1, device=device, dtype=dtype)
+        )
+        self.sh_coeffs_rest = nn.Parameter(
+            torch.zeros(N, 3, M - 1, device=device, dtype=dtype)
+        )
         
-        print(f"[SplatGUT] Created independent SH: N={N}, L={L}")
+        self._last_known_N = N  # ← 新增：记录当前点数
+        print(f"[SplatGUT] Independent SH initialized: N={N}, L={L}")
 
     def _disable_camera_decoder(self):
         """禁用相机 decoder."""
@@ -82,6 +81,92 @@ class SplatGUTModel(SplatADModel):
         
         # if hasattr(self, 'appearance_embedding'):
         #     self.appearance_embedding = nn.Identity()
+
+    def _sync_sh_if_needed(self):
+        """
+        自动同步 SH：完全断开旧 graph，创建新 Parameter.
+        
+        Linus: "Clean break, no half-measures!"
+        """
+        N_cur = self.gauss_params['means'].shape[0]
+        N_sh = self.sh_coeffs_dc.shape[0]
+        
+        if N_cur == N_sh:
+            return
+        
+        print(f"[SplatGUT] Densify detected! {N_sh} → {N_cur}, syncing SH...")
+        
+        device = self.sh_coeffs_dc.device
+        dtype = self.sh_coeffs_dc.dtype
+        M = self.sh_coeffs_rest.shape[-1] + 1
+        
+        # ============================================================
+        # 关键修复：完全断开旧连接，创建新 Parameter
+        # ============================================================
+        with torch.no_grad():
+            if N_cur > N_sh:
+                # 扩展
+                new_dc = torch.zeros(N_cur, 3, 1, device=device, dtype=dtype)
+                new_rest = torch.zeros(N_cur, 3, M - 1, device=device, dtype=dtype)
+                
+                # 复制旧数据（detach 确保断开连接）
+                new_dc[:N_sh] = self.sh_coeffs_dc.detach()
+                new_rest[:N_sh] = self.sh_coeffs_rest.detach()
+                
+            else:
+                # 裁剪
+                print(f"[SplatGUT] WARNING: Pruning to {N_cur}")
+                new_dc = self.sh_coeffs_dc[:N_cur].detach().clone()
+                new_rest = self.sh_coeffs_rest[:N_cur].detach().clone()
+        
+        # 先删除旧的（释放内存和 autograd 引用）
+        del self.sh_coeffs_dc
+        del self.sh_coeffs_rest
+        
+        # 清理 CUDA 缓存（可选但推荐）
+        torch.cuda.empty_cache()
+        
+        # 创建新 Parameter（全新的 autograd 对象）
+        self.sh_coeffs_dc = nn.Parameter(new_dc.contiguous(), requires_grad=True)
+        self.sh_coeffs_rest = nn.Parameter(new_rest.contiguous(), requires_grad=True)
+        
+        self._update_optimizer_for_sh()
+        
+        self._last_known_N = N_cur
+        print(f"[SplatGUT] SH synced and re-registered to optimizer")
+
+    def _update_optimizer_for_sh(self):
+        """
+        更新优化器：移除旧的 SH 参数，添加新的.
+        
+        Linus: "When you change the Parameter, you MUST update the optimizer!"
+        """
+        # 获取优化器（从 trainer 传入）
+        if not hasattr(self, 'optimizers') or self.optimizers is None:
+            print("[SplatGUT] WARNING: No optimizers found, SH may not be trained!")
+            return
+        
+        # SplatGUT 的 SH 在 'camera_sh' 组（根据 get_param_groups）
+        if 'camera_sh' not in self.optimizers.optimizers:
+            print("[SplatGUT] WARNING: 'camera_sh' optimizer not found!")
+            return
+        
+        optimizer = self.optimizers.optimizers['camera_sh']
+        
+        # 移除旧的参数组
+        # 注意：需要清除 state（momentum buffer 等）
+        optimizer.param_groups = []
+        optimizer.state.clear()
+        
+        # 添加新参数组
+        lr = self.optimizers.config['camera_sh']['optimizer'].lr
+        optimizer.add_param_group({
+            'params': [self.sh_coeffs_dc, self.sh_coeffs_rest],
+            'lr': lr,
+            'name': 'camera_sh',
+        })
+        
+        print(f"[SplatGUT] Optimizer updated: {len(optimizer.param_groups)} groups")
 
     def _init_gut_renderer(self):
         """初始化 3DGUT."""
@@ -140,7 +225,8 @@ class SplatGUTModel(SplatADModel):
         # print(f"[DEBUG] isinstance(sensor, Lidars): {isinstance(sensor, Lidars)}")
         # print(f"[DEBUG] RayBundle class: {RayBundle}")
         # print(f"[DEBUG] Cameras class: {Cameras}")
-        
+        if hasattr(self, 'sh_coeffs_dc'):  # 只在相机渲染时需要
+            self._sync_sh_if_needed()
         # LiDAR → 父类
         if isinstance(sensor, Lidars):
             print("[DEBUG] → Lidars branch")
@@ -250,7 +336,7 @@ class SplatGUTModel(SplatADModel):
         
         # Step 3: 降采样
         scale = self._get_downscale_factor()
-        print(f"[DEBUG] downscale_factor: {scale}")
+        # print(f"[DEBUG] downscale_factor: {scale}")
         
         if scale != 1:
             # print(f"[DEBUG] Rescaling with factor {1/scale}")
@@ -379,13 +465,17 @@ class SplatGUTModel(SplatADModel):
         return torch.stack([sin_t * cos_p, sin_t * sin_p, cos_t], dim=-1)
 
     def _build_gauss_params_with_sh(self) -> dict:
-        """构建 gauss_params（用 SH 替换 features）."""
+        """构建 gauss_params（用独立 SH 替换 features）."""
         gauss_params_sh = {}
         
+        # Linus: 精确排除，不用模糊匹配！
+        EXCLUDE_KEYS = {'features_dc', 'features_rest'}
+        
         for key, val in self.gauss_params.items():
-            if 'features' not in key.lower():
+            if key not in EXCLUDE_KEYS:  # ← 精确匹配
                 gauss_params_sh[key] = val
         
+        # 添加独立 SH
         gauss_params_sh['features_dc'] = self.sh_coeffs_dc
         gauss_params_sh['features_rest'] = self.sh_coeffs_rest
         
@@ -415,29 +505,16 @@ class SplatGUTModel(SplatADModel):
         """优化器参数组."""
         groups = super().get_param_groups()
         
-        for group_name in list(groups.keys()):
-            if group_name in ['features_dc', 'features_rest', 'sh', 'fields']:
-                filtered = [
-                    p for p in groups[group_name]
-                    if p is not None and not any(
-                        id(p) == id(v) for k, v in self.gauss_params.items()
-                        if v is not None and 'features' in k.lower()
-                    )
-                ]
-                
-                if filtered:
-                    groups[group_name] = filtered
-                else:
-                    del groups[group_name]
+        # 移除父类添加的 features 组（LiDAR 用的）
+        # 因为我们用独立的 SH 替代
+        if 'features_dc' in groups:
+            del groups['features_dc']
+        if 'features_rest' in groups:
+            del groups['features_rest']
         
-        sh_group = []
-        if hasattr(self, 'sh_coeffs_dc'):
-            sh_group.append(self.sh_coeffs_dc)
-        if hasattr(self, 'sh_coeffs_rest'):
-            sh_group.append(self.sh_coeffs_rest)
-        
-        if sh_group:
-            groups["sh"] = sh_group
+        # 添加独立 SH 组
+        if hasattr(self, 'sh_coeffs_dc') and hasattr(self, 'sh_coeffs_rest'):
+            groups['sh'] = [self.sh_coeffs_dc, self.sh_coeffs_rest]
         
         return groups
 
@@ -449,4 +526,4 @@ class SplatGUTModel(SplatADModel):
     def _get_downscale_factor(self) -> float:
         if hasattr(super(), '_get_downscale_factor'):
             return super()._get_downscale_factor()
-        return 1.0
+        return 4.0
