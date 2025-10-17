@@ -272,25 +272,45 @@ class GUT3DRenderer:
         self.tracer = threedgut_tracer.Tracer(OmegaConf.create(config))
         self._wrapper_cache = {}
 
-    def render(self, model, camera, rays_o, rays_d, c2w) -> Dict[str, Tensor]:
-        # 缓存策略：基于model id和数据指针
-        model_id = id(model)
-        cache_key = (
-            model_id,
-            model.means.data_ptr(),
-            model.num_points if hasattr(model, 'num_points') else model.means.shape[0]
+    @staticmethod
+    def _gaussian_state_signature(model) -> tuple:
+        params = (
+            model.means,
+            model.scales,
+            model.quats,
+            model.opacities,
+            model.features_dc,
+            model.features_rest,
         )
-        
-        # 检查缓存是否有效
-        if cache_key not in self._wrapper_cache:
-            # 清理旧缓存避免内存泄漏
-            if len(self._wrapper_cache) > 10:
+        versions = tuple(int(getattr(p, "_version", 0)) for p in params)
+        counts = (
+            int(model.num_points) if hasattr(model, "num_points") else int(model.means.shape[0]),
+            int(model.features_rest.shape[1]),
+        )
+        device = str(model.means.device)
+        return versions, counts, device
+
+    def render(self, model, camera, rays_o, rays_d, c2w) -> Dict[str, Tensor]:
+        # 缓存策略：基于model id和高斯参数的版本号
+        model_id = id(model)
+        state_signature = self._gaussian_state_signature(model)
+        cache_entry = self._wrapper_cache.get(model_id)
+
+        needs_refresh = True
+        if cache_entry is not None:
+            cached_sig = cache_entry["signature"]
+            if cached_sig == state_signature:
+                gaussians = cache_entry["wrapper"]
+                needs_refresh = False
+
+        if needs_refresh:
+            if len(self._wrapper_cache) > 16:
                 self._wrapper_cache.clear()
-            
             gaussians = GaussiansWrapper(model)
-            self._wrapper_cache[cache_key] = gaussians
-        else:
-            gaussians = self._wrapper_cache[cache_key]
+            self._wrapper_cache[model_id] = {
+                "signature": state_signature,
+                "wrapper": gaussians,
+            }
 
         fisheye_dist = None
         if hasattr(model, 'config'):
@@ -317,6 +337,11 @@ class GUT3DRenderer:
                 torch.cuda.empty_cache()
                 gaussians = GaussiansWrapper(model)
                 outputs = self.tracer.render(gaussians, batch, train=model.training)
+                refreshed_signature = self._gaussian_state_signature(model)
+                self._wrapper_cache[model_id] = {
+                    "signature": refreshed_signature,
+                    "wrapper": gaussians,
+                }
             else:
                 raise
 

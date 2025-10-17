@@ -143,14 +143,16 @@ class SplatGUTModel(SplatADModel):
 
         # Step 1: 相机优化 & 降采样
         if self.training or self.config.use_camopt_in_eval:
-            camera = self.camera_optimizer.apply_to_camera(camera)
+            optimized_c2w = self.camera_optimizer.apply_to_camera(camera)
+        else:
+            optimized_c2w = camera.camera_to_worlds
 
         scale = self._get_downscale_factor()
         if scale != 1:
             camera.rescale_output_resolution(1 / scale)
 
         W, H = int(camera.width.item()), int(camera.height.item())
-        c2w = camera.camera_to_worlds
+        c2w = optimized_c2w
 
         # 生成射线
         rays_o, rays_d = self._generate_camera_rays(camera, W, H, c2w)
@@ -243,7 +245,7 @@ class SplatGUTModel(SplatADModel):
             camera.distortion_params is not None
         ):
             # Use fisheye undistortion
-            rays_d = self._generate_fisheye_rays(x, y, fx, fy, cx, cy, camera, device)
+            rays_d = self._generate_fisheye_rays(x, y, fx, fy, cx, cy, camera, device, c2w)
         else:
             # Use pinhole projection
             dirs_cam = torch.stack([
@@ -263,7 +265,7 @@ class SplatGUTModel(SplatADModel):
         
         return rays_o, rays_d
     
-    def _generate_fisheye_rays(self, x, y, fx, fy, cx, cy, camera, device):
+    def _generate_fisheye_rays(self, x, y, fx, fy, cx, cy, camera, device, c2w):
         """
         Generate fisheye rays using Kannala-Brandt undistortion.
         
@@ -329,10 +331,6 @@ class SplatGUTModel(SplatADModel):
         ], dim=-1)
         
         # Transform to world space
-        c2w = camera.camera_to_worlds
-        if self.training or self.config.use_camopt_in_eval:
-            c2w = self.camera_optimizer.apply_to_camera(camera).camera_to_worlds
-        
         R = c2w[0, :3, :3] if c2w.dim() == 3 else c2w[:3, :3]
         rays_d = (dirs_cam @ R.T)
         rays_d = rays_d / rays_d.norm(dim=-1, keepdim=True)
