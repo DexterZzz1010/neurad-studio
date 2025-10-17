@@ -5,13 +5,9 @@ Single responsibility:
 - Convert SplatAD data to 3DGUT format (Batch + Gaussians)
 - Map flat features (3 + feature_dim) → RGB×SH [3*(L+1)^2] WITHOUT adding trainable params
 - Delegate to threedgut_tracer.Tracer.render()
-
-Design:
-    - CamerasToBatchConverter: Cameras → Batch
-    - GaussiansWrapper: SplatAD params → 3DGUT Gaussians interface (with Feature→SH)
-    - GUT3DRenderer: only builds Batch & calls Tracer.render()
 """
 
+import hashlib
 import math
 import numpy as np
 from typing import Dict, Optional
@@ -104,18 +100,14 @@ class CamerasToBatchConverter:
 
 class GaussiansWrapper:
     """
-    3DGUT Gaussians wrapper - CRITICAL FIX for compiled degree.
-    
-    3DGUT kernels are compiled with a fixed degree (default 3).
-    We MUST match this degree, padding features if necessary.
+    3DGUT Gaussians wrapper with optimized caching.
     """
+    _projection_matrix_cache = {}
 
     def __init__(self, model, camera_extent=None):
         self.model = model
         device = model.means.device
         dtype = torch.float32
-        
-        print(f"[GaussiansWrapper] Using device: {device} (type={device.type}, index={device.index})")
 
         # ============ POSITIONS: normalize ============
         cfg = getattr(model, "config", None)
@@ -125,21 +117,8 @@ class GaussiansWrapper:
         if not raw_means.is_cuda or raw_means.dtype != dtype:
             raw_means = raw_means.to(device=device, dtype=dtype)
         
-        means_min = raw_means.min().item()
-        means_max = raw_means.max().item()
-        means_range = means_max - means_min
-        # print(f"[GaussiansWrapper] Raw position range: [{means_min:.2f}, {means_max:.2f}] (span={means_range:.2f})")
-        
-        # if means_range > 1e7:
-        #     print(f"⚠️  WARNING: Extremely large position range ({means_range:.2e})!")
-        #     print(f"    This suggests numerical issues upstream. Proceeding with normalization...")
-        
         self.positions, self.normalization_center, self.normalization_scale = \
             self._normalize_positions_to_radius(raw_means, target_radius)
-        
-        pos_min = self.positions.min().item()
-        pos_max = self.positions.max().item()
-        # print(f"[GaussiansWrapper] Normalized position range: [{pos_min:.2f}, {pos_max:.2f}]")
         
         assert self.positions.device == device and self.positions.dtype == dtype
         assert self.positions.is_contiguous()
@@ -153,8 +132,6 @@ class GaussiansWrapper:
 
         log_scale = model.scales.to(dtype=dtype, device=device)
         log_scale_clamped = torch.clamp(log_scale, min=-10, max=5)
-        # if (log_scale != log_scale_clamped).any():
-        #     print(f"⚠️  WARNING: Clamped {(log_scale != log_scale_clamped).sum()} scale values")
         scl = torch.exp(log_scale_clamped)
         assert torch.isfinite(scl).all() and (scl > 0).all()
         self.scale = scl.contiguous()
@@ -178,35 +155,21 @@ class GaussiansWrapper:
         raw_rest = model.features_rest
         actual_K = int(raw_rest.shape[1])
         
-        # CRITICAL: 3DGUT default config has particle_radiance_sph_degree=3
-        # Kernel is compiled with PARTICLE_RADIANCE_NUM_COEFFS=(3+1)^2=16
-        # We MUST provide degree=3 features, padding if necessary
         COMPILED_DEGREE = 3
         self._sh_degree = COMPILED_DEGREE
         M = (COMPILED_DEGREE + 1) ** 2 - 1  # 15
         self.feature_width = 3 * (M + 1)    # 48
+        self.n_active_features = (COMPILED_DEGREE + 1) ** 2  # 16
 
-        # 关键修复：n_active_features是系数数量，不是degree！
-        self.n_active_features = (COMPILED_DEGREE + 1) ** 2  # 16，不是3！
-
-        # print(f"[GaussiansWrapper] Forcing SH degree={COMPILED_DEGREE}")
-        # print(f"[GaussiansWrapper] SH coefficients per channel: {self.n_active_features}")
-        # print(f"[GaussiansWrapper] Total feature width: {self.feature_width}")   
-        # Build projection matrix W: [actual_K, 3*M] = [K, 45]
-        if not hasattr(model, "_adaptor_W_cache"):
-            model._adaptor_W_cache = {}
-        
-        cache_key = (actual_K, 3 * M, str(dtype), str(device))
-        W = model._adaptor_W_cache.get(cache_key)
-        if W is None:
-            W = torch.empty(actual_K, 3 * M, device=device, dtype=dtype)
-            torch.nn.init.orthogonal_(W, gain=1.0)
+        # 使用类级别缓存获取投影矩阵
+        cache_key = (actual_K, 3 * M, str(device))
+        if cache_key not in GaussiansWrapper._projection_matrix_cache:
+            W = self._build_deterministic_projection(actual_K, 3 * M, device=device, dtype=dtype)
             W *= (1.0 / max(1, actual_K))
-            model._adaptor_W_cache[cache_key] = W
-            # print(f"[GaussiansWrapper] Created projection W: {tuple(W.shape)} on {W.device}")
+            GaussiansWrapper._projection_matrix_cache[cache_key] = W
         
-        assert W.device == device, f"W device {W.device} != target {device}"
-        self._W = W
+        self._W = GaussiansWrapper._projection_matrix_cache[cache_key]
+        assert self._W.device == device, f"W device {self._W.device} != target {device}"
 
         # Build features [N, 48] with coefficient-first RGB interleaving
         dc = model.features_dc.to(dtype=dtype, device=device)
@@ -228,16 +191,12 @@ class GaussiansWrapper:
         interleaved = torch.stack([r, g, b], dim=-1)
         features = interleaved.reshape(-1, 3 * (M + 1))
 
-        assert features.shape == (self.num_gaussians, self.feature_width), \
-            f"Feature shape {features.shape} vs expected ({self.num_gaussians}, {self.feature_width})"
+        assert features.shape == (self.num_gaussians, self.feature_width)
         assert features.device == device and features.dtype == dtype
         assert features.is_contiguous()
         assert torch.isfinite(features).all()
         
         self.features = features
-        
-        print(f"[GaussiansWrapper] Init complete: {self.num_gaussians} gaussians")
-        print(f"  SH degree: {self._sh_degree}, feature_width: {self.feature_width}, n_active_features: {self.n_active_features}")
 
         try:
             if cfg is not None:
@@ -261,8 +220,6 @@ class GaussiansWrapper:
         radius = max(q99, linf * 0.5, 1e-6)
         scale_factor = target_radius / radius
 
-        print(f"[normalize] center={center.tolist()}, radius={radius:.2f}, scale={scale_factor:.2e}")
-
         normalized = centered * scale_factor
         normalized = torch.clamp(normalized, min=-2.0 * target_radius, max=2.0 * target_radius)
 
@@ -279,47 +236,61 @@ class GaussiansWrapper:
     def background(self, T_to_world, rays_d, pred_rgb, pred_opacity, train):
         return pred_rgb, pred_opacity
 
+    @staticmethod
+    def _build_deterministic_projection(rows: int, cols: int, *, device, dtype) -> torch.Tensor:
+        """Create an orthogonal matrix that is deterministic given (rows, cols)."""
+        seed_material = f"{rows}x{cols}".encode("utf-8")
+        seed_bytes = hashlib.sha256(seed_material).digest()[:8]
+        seed = int.from_bytes(seed_bytes, "big")
+
+        gen = torch.Generator(device=device)
+        gen.manual_seed(seed)
+
+        base = torch.randn(rows, cols, generator=gen, device=device, dtype=dtype)
+
+        if rows < cols:
+            q, r = torch.linalg.qr(base.t(), mode='reduced')
+            q = q.t()
+        else:
+            q, r = torch.linalg.qr(base, mode='reduced')
+
+        diag = torch.diagonal(r)
+        phase = torch.sign(diag)
+        phase[phase == 0] = 1.0
+        q = q * phase
+
+        return q.contiguous()
+
 
 class GUT3DRenderer:
-    """Thin wrapper around threedgut_tracer.Tracer."""
+    """Thin wrapper around threedgut_tracer.Tracer with caching."""
 
     def __init__(self, config: dict):
         if not THREEDGUT_AVAILABLE:
             raise ImportError("threedgut_tracer not available")
         from omegaconf import OmegaConf
         self.tracer = threedgut_tracer.Tracer(OmegaConf.create(config))
-        self._first_render = True
-        self._gaussians_cache = None  # 缓存
-        self._cache_generation = -1    # 缓存版本号
+        self._wrapper_cache = {}
 
     def render(self, model, camera, rays_o, rays_d, c2w) -> Dict[str, Tensor]:
-        # 检查是否需要更新缓存
-        current_gen = getattr(model, '_generation', 0)  # 假设model有代数标记
+        # 缓存策略：基于model id和数据指针
+        model_id = id(model)
+        cache_key = (
+            model_id,
+            model.means.data_ptr(),
+            model.num_points if hasattr(model, 'num_points') else model.means.shape[0]
+        )
         
-        if self._gaussians_cache is None or self._cache_generation != current_gen:
-            print(f"[GUT3DRenderer] Creating/updating GaussiansWrapper (gen {current_gen})")
-            self._gaussians_cache = GaussiansWrapper(model)
-            self._cache_generation = current_gen
+        # 检查缓存是否有效
+        if cache_key not in self._wrapper_cache:
+            # 清理旧缓存避免内存泄漏
+            if len(self._wrapper_cache) > 10:
+                self._wrapper_cache.clear()
+            
+            gaussians = GaussiansWrapper(model)
+            self._wrapper_cache[cache_key] = gaussians
         else:
-            # 重用缓存的wrapper
-            pass
-        
-        gaussians = self._gaussians_cache
-
-        if self._first_render:
-            print("\n" + "="*70)
-            print("3DGUT RENDERER - FIRST RENDER")
-            print("="*70)
-            print(f"Gaussians: {gaussians.num_gaussians} particles")
-            print(f"  positions: {tuple(gaussians.positions.shape)} {gaussians.positions.dtype}")
-            print(f"  rotation: {tuple(gaussians.rotation.shape)}")
-            print(f"  scale: {tuple(gaussians.scale.shape)}")
-            print(f"  density: {tuple(gaussians.density.shape)}")
-            print(f"  features: {tuple(gaussians.features.shape)} (padded for degree=3)")
-            print(f"  n_active_features (for tracer): {gaussians.n_active_features}")
-            print(f"Rays: {tuple(rays_o.shape)}")
-            print("="*70 + "\n")
-            self._first_render = False
+            gaussians = self._wrapper_cache[cache_key]
 
         fisheye_dist = None
         if hasattr(model, 'config'):
@@ -339,14 +310,15 @@ class GUT3DRenderer:
         try:
             outputs = self.tracer.render(gaussians, batch, train=model.training)
         except RuntimeError as e:
-            print(f"\n[ERROR] 3DGUT render failed: {e}")
-            print(f"Gaussians: {gaussians.num_gaussians} particles")
-            print(f"  n_active_features: {gaussians.n_active_features}")
-            print(f"  feature_width: {gaussians.feature_width}")
-            print("Tensor shapes:")
-            print(f"  positions: {tuple(gaussians.positions.shape)}")
-            print(f"  features: {tuple(gaussians.features.shape)}")
-            raise
+            # 如果失败，清除缓存并重试一次
+            if "illegal memory access" in str(e):
+                self._wrapper_cache.clear()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                gaussians = GaussiansWrapper(model)
+                outputs = self.tracer.render(gaussians, batch, train=model.training)
+            else:
+                raise
 
         return {
             'rgb': outputs['pred_rgb'].squeeze(0),
