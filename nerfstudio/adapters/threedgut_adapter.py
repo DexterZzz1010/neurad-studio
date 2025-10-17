@@ -109,17 +109,15 @@ class GaussiansWrapper:
         device = model.means.device
         dtype = torch.float32
 
-        # ============ POSITIONS: normalize ============
+        # ============ POSITIONS ============
         cfg = getattr(model, "config", None)
-        target_radius = float(getattr(cfg, "target_radius", 200.0))
-        
+
         raw_means = model.means
         if not raw_means.is_cuda or raw_means.dtype != dtype:
             raw_means = raw_means.to(device=device, dtype=dtype)
-        
-        self.positions, self.normalization_center, self.normalization_scale = \
-            self._normalize_positions_to_radius(raw_means, target_radius)
-        
+
+        self.positions = raw_means.contiguous()
+
         assert self.positions.device == device and self.positions.dtype == dtype
         assert self.positions.is_contiguous()
         self.num_gaussians = self.positions.shape[0]
@@ -203,30 +201,6 @@ class GaussiansWrapper:
                 cfg.particle_radiance_sph_degree = self._sh_degree
         except Exception:
             pass
-
-    @staticmethod
-    def _normalize_positions_to_radius(means: torch.Tensor, target_radius: float):
-        """Normalize positions to fit within target_radius sphere."""
-        assert means.is_cuda and means.dtype == torch.float32
-        assert target_radius > 0
-
-        center = means.mean(dim=0, keepdim=False)
-        centered = means - center
-
-        dists = torch.linalg.norm(centered, dim=-1)
-        q99 = torch.quantile(dists, 0.99).item()
-        linf = centered.abs().amax().item()
-        
-        radius = max(q99, linf * 0.5, 1e-6)
-        scale_factor = target_radius / radius
-
-        normalized = centered * scale_factor
-        normalized = torch.clamp(normalized, min=-2.0 * target_radius, max=2.0 * target_radius)
-
-        assert normalized.is_cuda and normalized.dtype == torch.float32
-        assert torch.isfinite(normalized).all()
-
-        return normalized.contiguous(), center.detach(), torch.tensor(scale_factor, device=means.device)
 
     def get_rotation(self): return self.rotation
     def get_scale(self): return self.scale
