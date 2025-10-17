@@ -109,14 +109,16 @@ class GaussiansWrapper:
         device = model.means.device
         dtype = torch.float32
 
-        # ============ POSITIONS ============
+        # ============ POSITIONS: normalize ============
         cfg = getattr(model, "config", None)
-
+        target_radius = float(getattr(cfg, "target_radius", 200.0))
+        
         raw_means = model.means
         if not raw_means.is_cuda or raw_means.dtype != dtype:
             raw_means = raw_means.to(device=device, dtype=dtype)
 
-        self.positions = raw_means.contiguous()
+        self.positions, self.normalization_center, self.normalization_scale = \
+            self._normalize_positions_to_radius(raw_means, target_radius)
 
         assert self.positions.device == device and self.positions.dtype == dtype
         assert self.positions.is_contiguous()
@@ -211,6 +213,30 @@ class GaussiansWrapper:
         return pred_rgb, pred_opacity
 
     @staticmethod
+    def _normalize_positions_to_radius(means: torch.Tensor, target_radius: float):
+        """Normalize positions to fit within target_radius sphere."""
+        assert means.is_cuda and means.dtype == torch.float32
+        assert target_radius > 0
+
+        center = means.mean(dim=0, keepdim=False)
+        centered = means - center
+
+        dists = torch.linalg.norm(centered, dim=-1)
+        q99 = torch.quantile(dists, 0.99).item()
+        linf = centered.abs().amax().item()
+
+        radius = max(q99, linf * 0.5, 1e-6)
+        scale_factor = target_radius / radius
+
+        normalized = centered * scale_factor
+        normalized = torch.clamp(normalized, min=-2.0 * target_radius, max=2.0 * target_radius)
+
+        assert normalized.is_cuda and normalized.dtype == torch.float32
+        assert torch.isfinite(normalized).all()
+
+        return normalized.contiguous(), center.detach(), torch.tensor(scale_factor, device=means.device)
+
+    @staticmethod
     def _build_deterministic_projection(rows: int, cols: int, *, device, dtype) -> torch.Tensor:
         """Create an orthogonal matrix that is deterministic given (rows, cols)."""
         seed_material = f"{rows}x{cols}".encode("utf-8")
@@ -237,54 +263,17 @@ class GaussiansWrapper:
 
 
 class GUT3DRenderer:
-    """Thin wrapper around threedgut_tracer.Tracer with caching."""
+    """Thin wrapper around threedgut_tracer.Tracer with stateless conversion."""
 
     def __init__(self, config: dict):
         if not THREEDGUT_AVAILABLE:
             raise ImportError("threedgut_tracer not available")
         from omegaconf import OmegaConf
         self.tracer = threedgut_tracer.Tracer(OmegaConf.create(config))
-        self._wrapper_cache = {}
-
-    @staticmethod
-    def _gaussian_state_signature(model) -> tuple:
-        params = (
-            model.means,
-            model.scales,
-            model.quats,
-            model.opacities,
-            model.features_dc,
-            model.features_rest,
-        )
-        versions = tuple(int(getattr(p, "_version", 0)) for p in params)
-        counts = (
-            int(model.num_points) if hasattr(model, "num_points") else int(model.means.shape[0]),
-            int(model.features_rest.shape[1]),
-        )
-        device = str(model.means.device)
-        return versions, counts, device
 
     def render(self, model, camera, rays_o, rays_d, c2w) -> Dict[str, Tensor]:
-        # 缓存策略：基于model id和高斯参数的版本号
-        model_id = id(model)
-        state_signature = self._gaussian_state_signature(model)
-        cache_entry = self._wrapper_cache.get(model_id)
-
-        needs_refresh = True
-        if cache_entry is not None:
-            cached_sig = cache_entry["signature"]
-            if cached_sig == state_signature:
-                gaussians = cache_entry["wrapper"]
-                needs_refresh = False
-
-        if needs_refresh:
-            if len(self._wrapper_cache) > 16:
-                self._wrapper_cache.clear()
-            gaussians = GaussiansWrapper(model)
-            self._wrapper_cache[model_id] = {
-                "signature": state_signature,
-                "wrapper": gaussians,
-            }
+        # Stateless conversion: rebuild Gaussians every render call.
+        gaussians = GaussiansWrapper(model)
 
         fisheye_dist = None
         if hasattr(model, 'config'):
@@ -304,18 +293,12 @@ class GUT3DRenderer:
         try:
             outputs = self.tracer.render(gaussians, batch, train=model.training)
         except RuntimeError as e:
-            # 如果失败，清除缓存并重试一次
+            # 如果失败，强制同步并重建一次 wrapper 后重试
             if "illegal memory access" in str(e):
-                self._wrapper_cache.clear()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
                 gaussians = GaussiansWrapper(model)
                 outputs = self.tracer.render(gaussians, batch, train=model.training)
-                refreshed_signature = self._gaussian_state_signature(model)
-                self._wrapper_cache[model_id] = {
-                    "signature": refreshed_signature,
-                    "wrapper": gaussians,
-                }
             else:
                 raise
 
