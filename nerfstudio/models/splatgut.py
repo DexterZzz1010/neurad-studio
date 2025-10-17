@@ -154,6 +154,12 @@ class SplatGUTModel(SplatADModel):
         W, H = int(camera.width.item()), int(camera.height.item())
         c2w = optimized_c2w
 
+        # Dynamic actors: adjust Gaussian means to current actor poses
+        camera_times = camera.times
+        adjusted_means, _ = self._get_actor_adjusted_means(
+            self.means, camera_times, self.id, calc_vels=False
+        )
+
         # 生成射线
         rays_o, rays_d = self._generate_camera_rays(camera, W, H, c2w)
 
@@ -164,6 +170,7 @@ class SplatGUTModel(SplatADModel):
             rays_o=rays_o,
             rays_d=rays_d,
             c2w=c2w,
+            means_override=adjusted_means,
         )
 
         feat_or_rgb = outs["rgb"]     # [H,W,3] or [H,W,C_feat]

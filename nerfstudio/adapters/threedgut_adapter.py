@@ -104,7 +104,7 @@ class GaussiansWrapper:
     """
     _projection_matrix_cache = {}
 
-    def __init__(self, model, camera_extent=None):
+    def __init__(self, model, camera_extent=None, override_means: Optional[Tensor] = None):
         self.model = model
         device = model.means.device
         dtype = torch.float32
@@ -112,8 +112,8 @@ class GaussiansWrapper:
         # ============ POSITIONS: normalize ============
         cfg = getattr(model, "config", None)
         target_radius = float(getattr(cfg, "target_radius", 200.0))
-        
-        raw_means = model.means
+
+        raw_means = override_means if override_means is not None else model.means
         if not raw_means.is_cuda or raw_means.dtype != dtype:
             raw_means = raw_means.to(device=device, dtype=dtype)
 
@@ -271,9 +271,22 @@ class GUT3DRenderer:
         from omegaconf import OmegaConf
         self.tracer = threedgut_tracer.Tracer(OmegaConf.create(config))
 
-    def render(self, model, camera, rays_o, rays_d, c2w) -> Dict[str, Tensor]:
+    def render(self, model, camera, rays_o, rays_d, c2w, *, means_override: Optional[Tensor] = None) -> Dict[str, Tensor]:
         # Stateless conversion: rebuild Gaussians every render call.
-        gaussians = GaussiansWrapper(model)
+        gaussians = GaussiansWrapper(model, override_means=means_override)
+
+        center = gaussians.normalization_center.to(rays_o.device)
+        scale = gaussians.normalization_scale.to(rays_o.device)
+
+        rays_o_norm = (rays_o - center) * scale
+        rays_d_norm = rays_d * scale
+
+        if c2w.dim() == 3:
+            c2w_norm = c2w.clone()
+            c2w_norm[..., :3, 3] = (c2w[..., :3, 3] - center) * scale
+        else:
+            c2w_norm = c2w.clone()
+            c2w_norm[:3, 3] = (c2w[:3, 3] - center) * scale
 
         fisheye_dist = None
         if hasattr(model, 'config'):
@@ -283,9 +296,9 @@ class GUT3DRenderer:
 
         batch = CamerasToBatchConverter.convert(
             camera=camera,
-            camera_to_world=c2w,
-            rays_o=rays_o,
-            rays_d=rays_d,
+            camera_to_world=c2w_norm,
+            rays_o=rays_o_norm,
+            rays_d=rays_d_norm,
             camera_model=getattr(model.config, "camera_model", "pinhole"),
             fisheye_distortion=fisheye_dist,
         )
@@ -297,7 +310,26 @@ class GUT3DRenderer:
             if "illegal memory access" in str(e):
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-                gaussians = GaussiansWrapper(model)
+                gaussians = GaussiansWrapper(model, override_means=means_override)
+                center = gaussians.normalization_center.to(rays_o.device)
+                scale = gaussians.normalization_scale.to(rays_o.device)
+                rays_o_norm = (rays_o - center) * scale
+                rays_d_norm = rays_d * scale
+                if c2w.dim() == 3:
+                    c2w_norm = c2w.clone()
+                    c2w_norm[..., :3, 3] = (c2w[..., :3, 3] - center) * scale
+                else:
+                    c2w_norm = c2w.clone()
+                    c2w_norm[:3, 3] = (c2w[:3, 3] - center) * scale
+
+                batch = CamerasToBatchConverter.convert(
+                    camera=camera,
+                    camera_to_world=c2w_norm,
+                    rays_o=rays_o_norm,
+                    rays_d=rays_d_norm,
+                    camera_model=getattr(model.config, "camera_model", "pinhole"),
+                    fisheye_distortion=fisheye_dist,
+                )
                 outputs = self.tracer.render(gaussians, batch, train=model.training)
             else:
                 raise
