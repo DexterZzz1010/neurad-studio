@@ -8,6 +8,7 @@ Single responsibility:
 """
 
 import hashlib
+import os
 import math
 import numpy as np
 from typing import Dict, Optional
@@ -270,6 +271,11 @@ class GUT3DRenderer:
             raise ImportError("threedgut_tracer not available")
         from omegaconf import OmegaConf
         self.tracer = threedgut_tracer.Tracer(OmegaConf.create(config))
+        debug_every = os.environ.get("GUT_DEBUG_EVERY", None)
+        try:
+            self.debug_every = int(debug_every) if debug_every is not None else 0
+        except ValueError:
+            self.debug_every = 0
 
     def render(self, model, camera, rays_o, rays_d, c2w, *, means_override: Optional[Tensor] = None) -> Dict[str, Tensor]:
         # Stateless conversion: rebuild Gaussians every render call.
@@ -287,6 +293,26 @@ class GUT3DRenderer:
         else:
             c2w_norm = c2w.clone()
             c2w_norm[:3, 3] = (c2w[:3, 3] - center) * scale
+
+        step = int(getattr(model, "step", -1))
+        do_debug = self.debug_every > 0 and (step % self.debug_every == 0)
+        if do_debug:
+            with torch.no_grad():
+                pos_min = gaussians.positions.min().item()
+                pos_max = gaussians.positions.max().item()
+                density_stats = (gaussians.density.mean().item(), gaussians.density.min().item(), gaussians.density.max().item())
+                scale_stats = (gaussians.scale.mean().item(), gaussians.scale.min().item(), gaussians.scale.max().item())
+                feature_mean = gaussians.features.mean().item()
+                ray_o_stats = (rays_o_norm.min().item(), rays_o_norm.max().item())
+                ray_d_norms = rays_d_norm.norm(dim=-1)
+                ray_d_stats = (ray_d_norms.min().item(), ray_d_norms.max().item(), ray_d_norms.mean().item())
+                print(
+                    f"[GUT DEBUG][step={step}] pos_range=({pos_min:.3f},{pos_max:.3f}) "
+                    f"density(mean/min/max)=({density_stats[0]:.4f},{density_stats[1]:.4f},{density_stats[2]:.4f}) "
+                    f"scale(mean/min/max)=({scale_stats[0]:.4f},{scale_stats[1]:.4f},{scale_stats[2]:.4f}) "
+                    f"features_mean={feature_mean:.5f} rays_o_norm_range=({ray_o_stats[0]:.3f},{ray_o_stats[1]:.3f}) "
+                    f"rays_d_norm_range=({ray_d_stats[0]:.4f},{ray_d_stats[1]:.4f}) rays_d_norm_mean={ray_d_stats[2]:.4f}"
+                )
 
         fisheye_dist = None
         if hasattr(model, 'config'):
@@ -333,6 +359,19 @@ class GUT3DRenderer:
                 outputs = self.tracer.render(gaussians, batch, train=model.training)
             else:
                 raise
+
+        if do_debug:
+            with torch.no_grad():
+                rgb = outputs['pred_rgb']
+                alpha = outputs['pred_opacity']
+                rgb_stats = (rgb.min().item(), rgb.max().item(), rgb.mean().item())
+                alpha_stats = (alpha.min().item(), alpha.max().item(), alpha.mean().item())
+                depth_stats = (outputs['pred_dist'].min().item(), outputs['pred_dist'].max().item())
+                print(
+                    f"[GUT DEBUG][step={step}] rgb_range=({rgb_stats[0]:.4f},{rgb_stats[1]:.4f}) rgb_mean={rgb_stats[2]:.4f} "
+                    f"alpha_range=({alpha_stats[0]:.4f},{alpha_stats[1]:.4f}) alpha_mean={alpha_stats[2]:.4f} "
+                    f"depth_range=({depth_stats[0]:.4f},{depth_stats[1]:.4f})"
+                )
 
         return {
             'rgb': outputs['pred_rgb'].squeeze(0),

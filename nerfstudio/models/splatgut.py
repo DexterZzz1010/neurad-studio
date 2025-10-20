@@ -11,13 +11,16 @@ Linus principles:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Type
+from typing import Dict, Optional, Type, Union, Tuple
+import os
 
 import torch
 from torch import Tensor
 
 from nerfstudio.models.splatad import SplatADModel, SplatADModelConfig
 from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.cameras.lidars import Lidars
+from nerfstudio.cameras.rays import RayBundle
 
 
 @dataclass
@@ -163,6 +166,10 @@ class SplatGUTModel(SplatADModel):
         # 生成射线
         rays_o, rays_d = self._generate_camera_rays(camera, W, H, c2w)
 
+        step = int(getattr(self, "step", -1))
+        debug_every = int(os.environ.get("GUT_DEBUG_EVERY", "0") or 0)
+        do_debug = debug_every > 0 and (step % debug_every == 0)
+
         # Step 2: 3DGUT 渲染
         outs = self.gut_renderer.render(
             model=self,
@@ -187,22 +194,13 @@ class SplatGUTModel(SplatADModel):
         else:
             depth_ = depth
 
-        # Step 3: 仅当 3DGUT 返回“特征图”时才调用解码器
-        if feat_or_rgb.ndim == 3 and feat_or_rgb.shape[-1] == 3:
-            rgb_fg = feat_or_rgb            # 成品前景 RGB
-        else:
-            if not hasattr(self, "rgb_decoder"):
-                raise RuntimeError(
-                    "3DGUT returned a feature map but 'rgb_decoder' is not available. "
-                    "Either enable the decoder or configure tracer to output final RGB."
-                )
-            from nerfstudio.models.splatad import get_ray_dirs_pinhole
-            ray_dirs = get_ray_dirs_pinhole(camera, W, H, c2w)
-            if ray_dirs.dim() == 3:
-                ray_dirs = ray_dirs.unsqueeze(0)                  # [1,H,W,3]
-            appearance = self._get_appearance_embedding(camera, feat_or_rgb)  # [H,W,8]
-            features   = torch.cat([feat_or_rgb, appearance], dim=-1)         # [H,W,24]
-            rgb_fg     = self.rgb_decoder(features, ray_dirs).squeeze(0)      # [H,W,3]
+        # Step 3: 直接使用 3DGUT 输出的 RGB
+        if feat_or_rgb.ndim != 3 or feat_or_rgb.shape[-1] != 3:
+            raise RuntimeError(
+                "3DGUT tracer is expected to return final RGB with shape [H, W, 3]; "
+                f"got shape {tuple(feat_or_rgb.shape)}."
+            )
+        rgb_fg = feat_or_rgb
 
         # Step 4: 背景合成 + 返回 background（供 metrics 使用）
         bg = self._get_background_color()      # [3] or [H,W,3]
@@ -217,12 +215,54 @@ class SplatGUTModel(SplatADModel):
         if scale != 1:
             camera.rescale_output_resolution(scale)
 
+        if do_debug:
+            with torch.no_grad():
+                depth_min = depth_.min().item() if depth_.numel() > 0 else float("nan")
+                depth_max = depth_.max().item() if depth_.numel() > 0 else float("nan")
+                print(
+                    f"[GUT DEBUG][step={step}] gross_rgb_range=({rgb_fg.min().item():.4f},{rgb_fg.max().item():.4f}) "
+                    f"alpha_range=({alpha_.min().item():.4f},{alpha_.max().item():.4f}) "
+                    f"depth_range=({depth_min:.4f},{depth_max:.4f})"
+                )
+
         return {
             "rgb": rgb,                           # [H,W,3]  已与背景合成
             "depth": depth_,                      # [H,W]
             "accumulation": alpha_.squeeze(-1),   # [H,W]
             "background": bg_img,                 # [H,W,3]  供 metrics 对 GT 合成使用
         }
+
+    @torch.no_grad()
+    def get_outputs_for_lidar(
+        self, lidar: Lidars, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:  # type: ignore[override]
+        """Make SplatAD-style LiDAR metadata available, regardless of storage backend."""
+
+        original_metadata = lidar.metadata
+        metadata = {} if original_metadata is None else {k: v for k, v in original_metadata.items()}
+
+        propagate_keys = (
+            "raster_pts",
+            "raster_pts_valid_depth_and_did_return",
+            "raster_pts_did_return",
+            "raster_pts_valid_depth_and_did_not_return",
+            "elevation_boundaries",
+            "azimuth_resolution",
+        )
+        for key in propagate_keys:
+            if key in batch:
+                value = batch[key]
+                if isinstance(value, torch.Tensor):
+                    value = value.to(self.device)
+                metadata[key] = value
+
+        lidar.metadata = metadata
+        try:
+            outputs = self.get_lidar_outputs(lidar)
+        finally:
+            lidar.metadata = original_metadata
+
+        return outputs, batch
 
     
     def _generate_camera_rays(self, camera, W, H, c2w):

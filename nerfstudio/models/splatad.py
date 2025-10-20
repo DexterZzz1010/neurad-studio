@@ -47,6 +47,7 @@ from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.cnns import BasicBlock
 from nerfstudio.model_components.losses import L1Loss, MSELoss
+from nerfstudio.cameras.rays import RayBundle
 
 # need following import for background color override
 from nerfstudio.model_components.strategy import ADDefaultStrategy, ADMCMCStrategy
@@ -809,7 +810,7 @@ class SplatADModel(ADModel):
                 0,
             )
         else:
-            return 4
+            return 1
 
     def _downscale_if_required(self, image):
         d = self._get_downscale_factor()
@@ -1229,7 +1230,9 @@ class SplatADModel(ADModel):
 
         return out  # type: ignore
 
-    def get_outputs(self, sensor: Union[Cameras, Lidars]) -> Dict[str, Union[torch.Tensor, List]]:
+    def get_outputs(self, sensor: Union[Cameras, Lidars, RayBundle]) -> Dict[str, Union[torch.Tensor, List]]:
+        if isinstance(sensor, RayBundle):
+            return super().get_outputs(sensor)
         if self.training and hasattr(self, 'means'):
             # 使用step属性（如果有）或创建计数器
             current_step = getattr(self, 'step', 0)
@@ -1266,7 +1269,7 @@ class SplatADModel(ADModel):
         elif isinstance(sensor, Lidars):
             return self.get_lidar_outputs(sensor)
         else:
-            raise ValueError("Unknown sensor type")
+            raise ValueError(f"Unknown sensor type: {type(sensor)}")
 
     def get_gt_img(self, image: torch.Tensor):
         """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose
