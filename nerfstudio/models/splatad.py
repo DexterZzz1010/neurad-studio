@@ -47,7 +47,6 @@ from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.model_components.cnns import BasicBlock
 from nerfstudio.model_components.losses import L1Loss, MSELoss
-from nerfstudio.cameras.rays import RayBundle
 
 # need following import for background color override
 from nerfstudio.model_components.strategy import ADDefaultStrategy, ADMCMCStrategy
@@ -1230,9 +1229,7 @@ class SplatADModel(ADModel):
 
         return out  # type: ignore
 
-    def get_outputs(self, sensor: Union[Cameras, Lidars, RayBundle]) -> Dict[str, Union[torch.Tensor, List]]:
-        if isinstance(sensor, RayBundle):
-            return super().get_outputs(sensor)
+    def get_outputs(self, sensor: Union[Cameras, Lidars]) -> Dict[str, Union[torch.Tensor, List]]:
         if self.training and hasattr(self, 'means'):
             # 使用step属性（如果有）或创建计数器
             current_step = getattr(self, 'step', 0)
@@ -1269,7 +1266,79 @@ class SplatADModel(ADModel):
         elif isinstance(sensor, Lidars):
             return self.get_lidar_outputs(sensor)
         else:
-            raise ValueError(f"Unknown sensor type: {type(sensor)}")
+            raise ValueError("Unknown sensor type")
+
+    @torch.no_grad()
+    def get_outputs_for_lidar(
+        self,
+        lidar: Lidars,
+        batch: Dict[str, torch.Tensor],
+        obb_box: Optional[OrientedBox] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Takes in a camera, generates the raybundle, and computes the output of the model.
+        Overridden for a camera-based gaussian model.
+
+        Args:
+            camera: generates raybundle
+        """
+        assert lidar is not None, "must provide camera to gaussian model"
+        lidar = lidar.to(self.device)
+
+        if lidar.metadata is None:
+            lidar.metadata = {}
+
+        # Populate lidar metadata from batch if missing so rasterization succeeds.
+        def _maybe_to_device(value):
+            return value.to(self.device) if isinstance(value, torch.Tensor) else value
+
+        metadata_keys = ("raster_pts", "elevation_boundaries", "azimuth_resolution")
+        for key in metadata_keys:
+            if key in batch and key not in lidar.metadata:
+                lidar.metadata[key] = _maybe_to_device(batch[key])
+
+        outs = self.get_lidar_outputs(lidar)
+        # outs = self.get_outputs(lidar.to(self.device))
+
+        raster_pts = batch.get("raster_pts")
+        if raster_pts is None and lidar.metadata is not None:
+            raster_pts = lidar.metadata.get("raster_pts")
+
+        if raster_pts is not None:
+            raster_pts = raster_pts.to(self.device)
+            batch["raster_pts"] = raster_pts
+
+            azimuth = torch.deg2rad(raster_pts[..., 0])
+            elevation = torch.deg2rad(raster_pts[..., 1])
+            directions = torch.stack(
+                [
+                    torch.cos(elevation) * torch.cos(azimuth),
+                    torch.cos(elevation) * torch.sin(azimuth),
+                    torch.sin(elevation),
+                ],
+                dim=-1,
+            )
+
+            depth = outs["depth"].to(self.device)
+            depth = depth.contiguous().view(*directions.shape[:-1], 1)
+            points_local = directions * depth
+
+            linear_velocities = batch.get("linear_velocities_local")
+            if linear_velocities is not None:
+                linear_velocities = linear_velocities.to(self.device)
+                linear_velocities = linear_velocities.reshape(*([1] * (directions.dim() - 1)), 3)
+                time_offsets = raster_pts[..., 3:4]
+                points_local = points_local + linear_velocities * time_offsets
+
+            outs["points"] = points_local.reshape(-1, 3)
+
+            batch["is_lidar"] = torch.ones_like(raster_pts[..., 2:3], dtype=torch.bool, device=self.device)
+            batch["distance"] = raster_pts[..., 2:3].to(self.device)
+            if "raster_pts_did_return" in batch:
+                batch["did_return"] = batch["raster_pts_did_return"].to(self.device)
+            else:
+                batch["did_return"] = (raster_pts[..., 2:3] > 0).to(self.device)
+
+        return outs, batch
 
     def get_gt_img(self, image: torch.Tensor):
         """Compute groundtruth image with iteration dependent downscale factor for evaluation purpose

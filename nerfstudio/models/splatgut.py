@@ -11,16 +11,13 @@ Linus principles:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Type, Union, Tuple
-import os
+from typing import Dict, Optional, Type
 
 import torch
 from torch import Tensor
 
 from nerfstudio.models.splatad import SplatADModel, SplatADModelConfig
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.cameras.lidars import Lidars
-from nerfstudio.cameras.rays import RayBundle
 
 
 @dataclass
@@ -146,29 +143,17 @@ class SplatGUTModel(SplatADModel):
 
         # Step 1: 相机优化 & 降采样
         if self.training or self.config.use_camopt_in_eval:
-            optimized_c2w = self.camera_optimizer.apply_to_camera(camera)
-        else:
-            optimized_c2w = camera.camera_to_worlds
+            camera = self.camera_optimizer.apply_to_camera(camera)
 
         scale = self._get_downscale_factor()
         if scale != 1:
             camera.rescale_output_resolution(1 / scale)
 
         W, H = int(camera.width.item()), int(camera.height.item())
-        c2w = optimized_c2w
-
-        # Dynamic actors: adjust Gaussian means to current actor poses
-        camera_times = camera.times
-        adjusted_means, _ = self._get_actor_adjusted_means(
-            self.means, camera_times, self.id, calc_vels=False
-        )
+        c2w = camera.camera_to_worlds
 
         # 生成射线
         rays_o, rays_d = self._generate_camera_rays(camera, W, H, c2w)
-
-        step = int(getattr(self, "step", -1))
-        debug_every = int(os.environ.get("GUT_DEBUG_EVERY", "0") or 0)
-        do_debug = debug_every > 0 and (step % debug_every == 0)
 
         # Step 2: 3DGUT 渲染
         outs = self.gut_renderer.render(
@@ -177,7 +162,6 @@ class SplatGUTModel(SplatADModel):
             rays_o=rays_o,
             rays_d=rays_d,
             c2w=c2w,
-            means_override=adjusted_means,
         )
 
         feat_or_rgb = outs["rgb"]     # [H,W,3] or [H,W,C_feat]
@@ -200,8 +184,8 @@ class SplatGUTModel(SplatADModel):
                 "3DGUT tracer is expected to return final RGB with shape [H, W, 3]; "
                 f"got shape {tuple(feat_or_rgb.shape)}."
             )
+        
         rgb_fg = feat_or_rgb
-
         # Step 4: 背景合成 + 返回 background（供 metrics 使用）
         bg = self._get_background_color()      # [3] or [H,W,3]
         if bg.ndim == 1:
@@ -215,54 +199,12 @@ class SplatGUTModel(SplatADModel):
         if scale != 1:
             camera.rescale_output_resolution(scale)
 
-        if do_debug:
-            with torch.no_grad():
-                depth_min = depth_.min().item() if depth_.numel() > 0 else float("nan")
-                depth_max = depth_.max().item() if depth_.numel() > 0 else float("nan")
-                print(
-                    f"[GUT DEBUG][step={step}] gross_rgb_range=({rgb_fg.min().item():.4f},{rgb_fg.max().item():.4f}) "
-                    f"alpha_range=({alpha_.min().item():.4f},{alpha_.max().item():.4f}) "
-                    f"depth_range=({depth_min:.4f},{depth_max:.4f})"
-                )
-
         return {
             "rgb": rgb,                           # [H,W,3]  已与背景合成
             "depth": depth_,                      # [H,W]
             "accumulation": alpha_.squeeze(-1),   # [H,W]
             "background": bg_img,                 # [H,W,3]  供 metrics 对 GT 合成使用
         }
-
-    @torch.no_grad()
-    def get_outputs_for_lidar(
-        self, lidar: Lidars, batch: Dict[str, torch.Tensor]
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:  # type: ignore[override]
-        """Make SplatAD-style LiDAR metadata available, regardless of storage backend."""
-
-        original_metadata = lidar.metadata
-        metadata = {} if original_metadata is None else {k: v for k, v in original_metadata.items()}
-
-        propagate_keys = (
-            "raster_pts",
-            "raster_pts_valid_depth_and_did_return",
-            "raster_pts_did_return",
-            "raster_pts_valid_depth_and_did_not_return",
-            "elevation_boundaries",
-            "azimuth_resolution",
-        )
-        for key in propagate_keys:
-            if key in batch:
-                value = batch[key]
-                if isinstance(value, torch.Tensor):
-                    value = value.to(self.device)
-                metadata[key] = value
-
-        lidar.metadata = metadata
-        try:
-            outputs = self.get_lidar_outputs(lidar)
-        finally:
-            lidar.metadata = original_metadata
-
-        return outputs, batch
 
     
     def _generate_camera_rays(self, camera, W, H, c2w):
@@ -292,7 +234,7 @@ class SplatGUTModel(SplatADModel):
             camera.distortion_params is not None
         ):
             # Use fisheye undistortion
-            rays_d = self._generate_fisheye_rays(x, y, fx, fy, cx, cy, camera, device, c2w)
+            rays_d = self._generate_fisheye_rays(x, y, fx, fy, cx, cy, camera, device)
         else:
             # Use pinhole projection
             dirs_cam = torch.stack([
@@ -312,7 +254,7 @@ class SplatGUTModel(SplatADModel):
         
         return rays_o, rays_d
     
-    def _generate_fisheye_rays(self, x, y, fx, fy, cx, cy, camera, device, c2w):
+    def _generate_fisheye_rays(self, x, y, fx, fy, cx, cy, camera, device):
         """
         Generate fisheye rays using Kannala-Brandt undistortion.
         
@@ -378,6 +320,10 @@ class SplatGUTModel(SplatADModel):
         ], dim=-1)
         
         # Transform to world space
+        c2w = camera.camera_to_worlds
+        if self.training or self.config.use_camopt_in_eval:
+            c2w = self.camera_optimizer.apply_to_camera(camera).camera_to_worlds
+        
         R = c2w[0, :3, :3] if c2w.dim() == 3 else c2w[:3, :3]
         rays_d = (dirs_cam @ R.T)
         rays_d = rays_d / rays_d.norm(dim=-1, keepdim=True)

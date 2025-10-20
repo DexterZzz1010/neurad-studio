@@ -131,9 +131,10 @@ class GaussiansWrapper:
         assert torch.isfinite(rot).all() and (rot.norm(dim=-1) > 0.99).all()
         self.rotation = rot.contiguous()
 
+        norm_scale = self.normalization_scale.to(dtype=dtype, device=device)
         log_scale = model.scales.to(dtype=dtype, device=device)
         log_scale_clamped = torch.clamp(log_scale, min=-10, max=5)
-        scl = torch.exp(log_scale_clamped)
+        scl = torch.exp(log_scale_clamped) * norm_scale
         assert torch.isfinite(scl).all() and (scl > 0).all()
         self.scale = scl.contiguous()
 
@@ -281,18 +282,18 @@ class GUT3DRenderer:
         # Stateless conversion: rebuild Gaussians every render call.
         gaussians = GaussiansWrapper(model, override_means=means_override)
 
-        center = gaussians.normalization_center.to(rays_o.device)
-        scale = gaussians.normalization_scale.to(rays_o.device)
+        center = gaussians.normalization_center.to(rays_o.device, dtype=rays_o.dtype)
+        norm_scale = gaussians.normalization_scale.to(rays_o.device, dtype=rays_o.dtype)
 
-        rays_o_norm = (rays_o - center) * scale
-        rays_d_norm = rays_d * scale
+        rays_o_norm = (rays_o - center) * norm_scale
+        rays_d_norm = F.normalize(rays_d, dim=-1)
 
         if c2w.dim() == 3:
             c2w_norm = c2w.clone()
-            c2w_norm[..., :3, 3] = (c2w[..., :3, 3] - center) * scale
+            c2w_norm[..., :3, 3] = (c2w[..., :3, 3] - center) * norm_scale
         else:
             c2w_norm = c2w.clone()
-            c2w_norm[:3, 3] = (c2w[:3, 3] - center) * scale
+            c2w_norm[:3, 3] = (c2w[:3, 3] - center) * norm_scale
 
         step = int(getattr(model, "step", -1))
         do_debug = self.debug_every > 0 and (step % self.debug_every == 0)
@@ -337,16 +338,16 @@ class GUT3DRenderer:
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
                 gaussians = GaussiansWrapper(model, override_means=means_override)
-                center = gaussians.normalization_center.to(rays_o.device)
-                scale = gaussians.normalization_scale.to(rays_o.device)
-                rays_o_norm = (rays_o - center) * scale
-                rays_d_norm = rays_d * scale
+                center = gaussians.normalization_center.to(rays_o.device, dtype=rays_o.dtype)
+                norm_scale = gaussians.normalization_scale.to(rays_o.device, dtype=rays_o.dtype)
+                rays_o_norm = (rays_o - center) * norm_scale
+                rays_d_norm = F.normalize(rays_d, dim=-1)
                 if c2w.dim() == 3:
                     c2w_norm = c2w.clone()
-                    c2w_norm[..., :3, 3] = (c2w[..., :3, 3] - center) * scale
+                    c2w_norm[..., :3, 3] = (c2w[..., :3, 3] - center) * norm_scale
                 else:
                     c2w_norm = c2w.clone()
-                    c2w_norm[:3, 3] = (c2w[:3, 3] - center) * scale
+                    c2w_norm[:3, 3] = (c2w[:3, 3] - center) * norm_scale
 
                 batch = CamerasToBatchConverter.convert(
                     camera=camera,
@@ -359,6 +360,8 @@ class GUT3DRenderer:
                 outputs = self.tracer.render(gaussians, batch, train=model.training)
             else:
                 raise
+
+        depth_world = outputs['pred_dist'].squeeze(0) / norm_scale
 
         if do_debug:
             with torch.no_grad():
@@ -375,6 +378,6 @@ class GUT3DRenderer:
 
         return {
             'rgb': outputs['pred_rgb'].squeeze(0),
-            'depth': outputs['pred_dist'].squeeze(0),
+            'depth': depth_world,
             'alpha': outputs['pred_opacity'].squeeze(0),
         }
