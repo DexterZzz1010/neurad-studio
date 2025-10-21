@@ -18,6 +18,7 @@ from torch import Tensor
 
 from nerfstudio.models.splatad import SplatADModel, SplatADModelConfig
 from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.engine.optimizers import Optimizers
 
 
 @dataclass
@@ -49,6 +50,34 @@ class SplatGUTModelConfig(SplatADModelConfig):
     """Config of the camera velocity optimizer to use"""
     feature_dim: int = 45
 
+    # Normalization / scale handling
+    target_radius: float = -1.0
+    """If >0, positions are normalized to this radius before tracing. <=0 switches to auto (scene extent)."""
+
+    disable_normalization: bool = False
+    """Skip position normalization entirely to match raw 3DGUT world coordinates."""
+
+    scene_extent: Optional[float] = None
+    """Override scene extent (max scene radius) if known. Auto-computed otherwise."""
+
+    # Optimizer controls (mirrors 3DGUT defaults)
+    use_3dgut_optimizer: bool = True
+    """If True, rescale Gaussian learning rates using 3DGUT schedule."""
+
+    means_lr_base: float = 1.6e-4
+    scales_lr: float = 5e-3
+    quats_lr: float = 1e-3
+    opacities_lr: float = 5e-2
+    features_dc_lr: float = 2.5e-3
+    features_rest_lr: float = 1.25e-3 / 3.0
+
+    # Densification / pruning
+    use_3dgut_strategy: bool = True
+    """Convert cull / densify thresholds to ratios based on scene extent."""
+
+    strategy_extent_epsilon: float = 1e-3
+    """Minimum extent used when normalizing thresholds."""
+
 class SplatGUTModel(SplatADModel):
     """
     SplatAD with 3DGUT.
@@ -69,10 +98,21 @@ class SplatGUTModel(SplatADModel):
     
 
     config: SplatGUTModelConfig
+    _gut_lr_synced: bool = False
+    scene_extent: float = 1.0
     
     def populate_modules(self):
         """Initialize all modules (calls parent for everything)."""
         super().populate_modules()
+
+        self._gut_lr_synced = False
+        self.scene_extent = float(self._compute_scene_extent())
+        self.config.scene_extent = self.scene_extent
+
+        if not self.config.disable_normalization and self.config.target_radius <= 0:
+            self.config.target_radius = self.scene_extent
+
+        self._maybe_tune_strategy(self.scene_extent)
         
         if self.config.use_ray_tracing:
             # Lazy import to avoid circular dependency
@@ -127,6 +167,11 @@ class SplatGUTModel(SplatADModel):
             print(f"  - SH degree: {sh_degree}")
             print(f"  - K-buffer size: {self.config.k_buffer_size}")
             print(f"  - UT params: α={self.config.ut_alpha}, β={self.config.ut_beta}")
+
+    def step_cb(self, optimizers: Optimizers, step):
+        super().step_cb(optimizers, step)
+        if self.config.use_3dgut_optimizer and not self._gut_lr_synced:
+            self._apply_3dgut_learning_rates(optimizers.optimizers)
     
     def get_outputs_for_camera(self, camera: Cameras) -> Dict[str, Tensor]:
         """
@@ -253,6 +298,69 @@ class SplatGUTModel(SplatADModel):
         rays_o = t[None, None, :].expand(H, W, 3)
         
         return rays_o, rays_d
+
+    def _compute_scene_extent(self) -> float:
+        """Estimate scene extent from scene box / seed points."""
+        bounds = self.scene_box.aabb.to(torch.float32)
+        span = bounds[1] - bounds[0]
+        extent = float(torch.max(span).item())
+
+        if self.seed_points is not None and len(self.seed_points) > 0:
+            points = self.seed_points[0]
+            if points is not None and points.numel() > 0:
+                pts = points.to(torch.float32)
+                pts_extent = float((pts.max(dim=0)[0] - pts.min(dim=0)[0]).max().item())
+                extent = max(extent, pts_extent)
+
+        return max(extent, self.config.strategy_extent_epsilon)
+
+    def _maybe_tune_strategy(self, scene_extent: float) -> None:
+        """Reinitialize densification strategy with scene-aware scale."""
+        strategy = getattr(self, "strategy", None)
+        if strategy is None:
+            return
+
+        init_fn = getattr(strategy, "initialize_state", None)
+        if init_fn is None:
+            return
+
+        try:
+            state = init_fn(scene_scale=scene_extent)
+        except TypeError:
+            state = init_fn()
+
+        if isinstance(state, dict) and "scene_scale" in state:
+            state["scene_scale"] = scene_extent
+        self.strategy_state = state
+
+        if self.config.use_3dgut_strategy and hasattr(strategy, "prune_scale3d"):
+            denom = max(scene_extent, self.config.strategy_extent_epsilon)
+            strategy.prune_scale3d = self.config.cull_scale_thresh / denom
+            strategy.grow_scale3d = self.config.densify_size_thresh / denom
+
+    def _apply_3dgut_learning_rates(self, optimizer_dict: Dict[str, torch.optim.Optimizer]) -> None:
+        """Match 3DGUT per-parameter learning rates (scale-aware)."""
+        if self.config.scene_extent is None:
+            return
+
+        scene_extent = float(max(self.config.scene_extent, self.config.strategy_extent_epsilon))
+        lr_table = {
+            "means": self.config.means_lr_base * scene_extent,
+            "scales": self.config.scales_lr,
+            "quats": self.config.quats_lr,
+            "opacities": self.config.opacities_lr,
+            "features_dc": self.config.features_dc_lr,
+            "features_rest": self.config.features_rest_lr,
+        }
+
+        for group_name, lr_value in lr_table.items():
+            if group_name not in optimizer_dict:
+                continue
+            optimizer = optimizer_dict[group_name]
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr_value
+
+        self._gut_lr_synced = True
     
     def _generate_fisheye_rays(self, x, y, fx, fy, cx, cy, camera, device):
         """

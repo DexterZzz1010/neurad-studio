@@ -21,6 +21,7 @@ render.py
 from __future__ import annotations
 
 import gzip
+import math
 import json
 import os
 import pickle
@@ -53,6 +54,7 @@ from nerfstudio.cameras.camera_paths import (
     get_spiral_path,
 )
 from nerfstudio.cameras.cameras import Cameras, CameraType, RayBundle
+from gsplat import map_points_to_lidar_tiles, points_mapping_offset_encode, populate_image_from_points
 from nerfstudio.cameras.lidars import transform_points
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, VanillaDataManagerConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
@@ -60,6 +62,7 @@ from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManage
 from nerfstudio.data.datamanagers.random_cameras_datamanager import RandomCamerasDataManager
 from nerfstudio.data.datasets.base_dataset import Dataset
 from nerfstudio.data.scene_box import OrientedBox
+from nerfstudio.data.utils.lidar_elevation_mappings import PANDAR64_ELEVATION_MAPPING
 from nerfstudio.data.utils.dataloaders import FixedIndicesEvalDataloader
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.model_components import renderers
@@ -68,6 +71,7 @@ from nerfstudio.utils import colormaps, install_checks
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE, ItersPerSecColumn
 from nerfstudio.utils.scripts import run_command
+from nerfstudio.data.datamanagers.full_images_lidar_datamanager import AZIM_CHANNELS_PER_TILE, ELEV_CHANNELS_PER_TILE
 
 
 def _render_trajectory_video(
@@ -1155,14 +1159,53 @@ class DatasetRender(BaseRender):
                         for lidar_idx, (lidar, batch) in enumerate(
                             progress.track(lidar_dataloader, total=len(lidar_dataloader))
                         ):
-                            lidar_output, _ = pipeline.model.get_outputs_for_lidar(lidar, batch=batch)
+                            elevation_boundaries = torch.tensor(
+                                [-25.8970, -8.5595, -5.1430, -3.7980, -2.4505, -1.0985, 0.2530, 1.6050, 15.8820],
+                                dtype=torch.float32,
+                                device=pipeline.device,
+                            )
+                            azimuth_resolution = 0.2
+                            elevation_mapping = torch.tensor(
+                                sorted(PANDAR64_ELEVATION_MAPPING.values()), dtype=torch.float32, device=pipeline.device
+                            )
+
+                            raster_pts = lidar_to_raster_pts(
+                                batch["lidar"],
+                                lidar,
+                                elevation_boundaries,
+                                elevation_mapping,
+                                azimuth_resolution,
+                            )
+
+                            lidar.metadata["elevation_boundaries"] = elevation_boundaries
+                            lidar.metadata["azimuth_resolution"] = azimuth_resolution
+                            lidar.metadata["raster_pts"] = raster_pts
+
+                            valid_lidar_distance_threshold = 1e3
+                            batch["raster_pts_did_return"] = raster_pts[..., 2] <= valid_lidar_distance_threshold
+                            batch["raster_pts_valid_depth_and_did_return"] = (
+                                (batch["raster_pts_did_return"] & (raster_pts[..., 2] > 0)).flatten().nonzero().squeeze()
+                            )
+                            batch["raster_pts_valid_depth_and_did_not_return"] = (
+                                (~batch["raster_pts_did_return"] & (raster_pts[..., 2] > 0)).flatten().nonzero().squeeze()
+                            )
+                            batch["raster_pts"] = raster_pts
+                            batch["lidar_pts_did_return"] = (
+                                batch["lidar"].norm(dim=-1) <= valid_lidar_distance_threshold
+                            )
+                            batch["linear_velocities_local"] = lidar.metadata["linear_velocities_local"]
+
+                            lidar_output = pipeline.model.get_outputs_for_lidar(lidar)
+                            lidar_output, gt = filter_lidar_pred_and_gt(lidar_output, batch)
                             points_in_local = lidar_output["points"]
+
                             if "ray_drop_prob" in lidar_output:
-                                points_in_local = points_in_local[(lidar_output["ray_drop_prob"] < 0.5).squeeze(-1)]
+                                mask = (lidar_output["ray_drop_prob"] < 0.5).squeeze(-1)
+                                points_in_local = points_in_local[mask]
 
                             points_in_world = transform_points(points_in_local, lidar.lidar_to_worlds[0])
-                            # get ground truth for comparison
                             gt_point_in_world = transform_points(batch["lidar"][..., :3], lidar.lidar_to_worlds[0])
+
                             plot_lidar_points(
                                 gt_point_in_world.cpu().detach().numpy(), output_path / f"gt-lidar_{lidar_idx}.png"
                             )
@@ -1185,6 +1228,173 @@ class DatasetRender(BaseRender):
         for split in self.pose_source.split("+"):
             table.add_row(f"Outputs {split}", str(self.output_path / split))
         CONSOLE.print(Panel(table, title="[bold][green]:tada: Render on split {} Complete :tada:[/bold]", expand=False))
+
+
+def save_ply(points, path="output.ply") -> None:
+    try:
+        import open3d as o3d
+    except ImportError:
+        CONSOLE.log("open3d not installed; skipping PLY export.", style="bold yellow")
+        return
+
+    points_np = points.cpu().numpy()
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_np)
+    o3d.io.write_point_cloud(path, pcd)
+
+
+def lidar_to_raster_pts(
+    point_cloud: torch.Tensor,
+    lidar,
+    elevation_boundaries: torch.Tensor,
+    elevation_mapping,
+    azimuth_resolution: float,
+    is_eval: bool = True,
+):
+    linear_velocities_local = lidar.metadata.get("linear_velocities_local")
+    if linear_velocities_local is None:
+        linear_velocities_local = torch.zeros((1, 3), device=point_cloud.device, dtype=point_cloud.dtype)
+    else:
+        linear_velocities_local = linear_velocities_local.to(point_cloud.device)
+
+    rs_adjusted_point_cloud = point_cloud[:, :3] - linear_velocities_local * point_cloud[..., 4:5]
+
+    azimuth = torch.rad2deg(torch.atan2(rs_adjusted_point_cloud[:, 1], rs_adjusted_point_cloud[:, 0]))
+    distance = torch.linalg.vector_norm(rs_adjusted_point_cloud[:, :3], dim=1)
+    elevation = torch.rad2deg(torch.asin(rs_adjusted_point_cloud[:, 2] / distance))
+
+    intensity = point_cloud[:, 3]
+    point_cloud_time = point_cloud[:, 4]
+    spherical_coords_time_intensity = torch.stack(
+        [azimuth, elevation, distance, point_cloud_time, intensity], dim=1
+    ).to(point_cloud.device)
+    points_tile_ids, flatten_ids = map_points_to_lidar_tiles(
+        spherical_coords_time_intensity[None, :, :2],
+        elevation_boundaries,
+        azimuth_resolution * AZIM_CHANNELS_PER_TILE,
+        -180.0,
+    )
+    tile_width = math.ceil(360 / (azimuth_resolution * AZIM_CHANNELS_PER_TILE))
+    tile_height = len(elevation_boundaries) - 1
+    tile_offsets = points_mapping_offset_encode(points_tile_ids, 1, tile_width, tile_height)
+
+    image_width = tile_width * AZIM_CHANNELS_PER_TILE
+    image_height = len(elevation_mapping)
+
+    if is_eval:
+        points_per_tile = torch.cat(
+            [tile_offsets.flatten(), torch.tensor([point_cloud.shape[0]], device=tile_offsets.device)]
+        ).diff()
+        max_points_per_tile = ELEV_CHANNELS_PER_TILE * AZIM_CHANNELS_PER_TILE
+        n_batches = (points_per_tile // (max_points_per_tile + 1)).max() + 1
+        raster_pts_image = torch.zeros((n_batches, image_height, image_width, 5), device=point_cloud.device)
+        for batch_idx in range(n_batches):
+            flatten_ids_batch = torch.cat(
+                [
+                    flatten_ids[s : (s + n)]
+                    for s, n in zip(
+                        (tile_offsets.flatten() + max_points_per_tile * batch_idx),
+                        points_per_tile.clamp_max(max_points_per_tile),
+                    )
+                ]
+            )
+            tile_offsets_batch = (
+                torch.cat(
+                    [
+                        torch.tensor([0], device=points_per_tile.device),
+                        points_per_tile.clamp_max(max_points_per_tile).cumsum(dim=0)[:-1],
+                    ]
+                )
+                .view(tile_offsets.shape)
+                .int()
+            )
+            points_per_tile = (points_per_tile - max_points_per_tile).clamp_min(0)
+
+            raster_pts_image[batch_idx] = populate_image_from_points(
+                spherical_coords_time_intensity[None],
+                image_width=image_width,
+                image_height=image_height,
+                tile_width=AZIM_CHANNELS_PER_TILE,
+                tile_height=ELEV_CHANNELS_PER_TILE,
+                tile_offsets=tile_offsets_batch,
+                flatten_id=flatten_ids_batch,
+            )
+    else:
+        raster_pts_image = populate_image_from_points(
+            spherical_coords_time_intensity[None],
+            image_width=image_width,
+            image_height=image_height,
+            tile_width=AZIM_CHANNELS_PER_TILE,
+            tile_height=ELEV_CHANNELS_PER_TILE,
+            tile_offsets=tile_offsets,
+            flatten_id=flatten_ids,
+        )
+
+    return raster_pts_image
+
+
+def filter_lidar_pred_and_gt(
+    outputs: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    output_point_cloud: bool = True,
+):
+    gt_lidar = batch["raster_pts"]
+    raster_pts_valid_and_did_return = batch["raster_pts_valid_depth_and_did_return"]
+    raster_pts_did_return = batch["raster_pts_did_return"].flatten()
+    raster_pts_valid_and_did_not_return = batch["raster_pts_valid_depth_and_did_not_return"]
+
+    gt: Dict[str, torch.Tensor] = {}
+    gt["depth"] = gt_lidar[..., 2].flatten()[raster_pts_valid_and_did_return]
+    gt["intensity"] = gt_lidar[..., 4].flatten()[raster_pts_valid_and_did_return]
+    gt["ray_drop"] = ~raster_pts_did_return
+    gt["valid"] = gt_lidar[..., 2].flatten() > 0
+
+    pred: Dict[str, torch.Tensor] = {}
+    pred["depth"] = outputs["depth"].flatten()[raster_pts_valid_and_did_return]
+    pred["depth_dropped"] = outputs["depth"].flatten()[raster_pts_valid_and_did_not_return]
+    pred["intensity"] = outputs["intensity"].flatten()[raster_pts_valid_and_did_return]
+    pred["intensity_dropped"] = outputs["intensity"].flatten()[raster_pts_valid_and_did_not_return]
+    pred["ray_drop"] = outputs["ray_drop_logits"].flatten() * gt["valid"] - (~gt["valid"]) * 10_000
+    pred["accumulation"] = outputs["accumulation"].flatten()[raster_pts_valid_and_did_return]
+    pred["accumulation_dropped"] = outputs["accumulation"].flatten()[raster_pts_valid_and_did_not_return]
+    pred["median_depth"] = outputs["median_depth"].flatten()[raster_pts_valid_and_did_return]
+
+    if "alpha_sum_until_points" in outputs:
+        pred["alpha_sum_until_points"] = outputs["alpha_sum_until_points"].flatten()[
+            raster_pts_valid_and_did_return
+        ]
+        pred["alpha_sum_until_points_dropped"] = outputs["alpha_sum_until_points"].flatten()[
+            raster_pts_valid_and_did_not_return
+        ]
+
+    if output_point_cloud:
+        azimuth_angles = torch.deg2rad(gt_lidar[..., 0].flatten())
+        elevation_angles = torch.deg2rad(gt_lidar[..., 1].flatten())
+        directions = torch.stack(
+            [
+                torch.cos(elevation_angles) * torch.cos(azimuth_angles),
+                torch.cos(elevation_angles) * torch.sin(azimuth_angles),
+                torch.sin(elevation_angles),
+            ],
+            dim=-1,
+        )
+
+        gt["points"] = batch["lidar"][batch["lidar_pts_did_return"].squeeze(), :3]
+        linear_velocities_local = batch.get("linear_velocities_local")
+        if linear_velocities_local is None:
+            linear_velocities_local = torch.zeros((1, 3), device=directions.device, dtype=directions.dtype)
+        else:
+            linear_velocities_local = linear_velocities_local.to(directions.device)
+
+        time_offsets = gt_lidar[..., 3].view(-1, 1)
+        pred["points"] = (
+            outputs["depth"].view(-1, 1) * directions + linear_velocities_local * time_offsets
+        )[((pred["ray_drop"].sigmoid() <= 0.5) * gt["valid"])]
+        pred["median_points"] = (
+            outputs["median_depth"].view(-1, 1) * directions + linear_velocities_local * time_offsets
+        )[((pred["ray_drop"].sigmoid() <= 0.5) * gt["valid"])]
+
+    return pred, gt
 
 
 def plot_lidar_points(points, output_path, cmin=-6.0, cmax=5.0, width=1920, height=1080, ranges=[100, 200, 10]):

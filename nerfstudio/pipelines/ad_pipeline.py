@@ -133,7 +133,16 @@ class ADPipeline(VanillaPipeline):
 
         # Lidar eval
         lidar, batch = self.datamanager.next_eval_lidar(step)
-        outputs, batch = self.model.get_outputs_for_lidar(lidar, batch=batch)
+        try:
+            result = self.model.get_outputs_for_lidar(lidar, batch=batch)
+        except TypeError:
+            result = self.model.get_outputs_for_lidar(lidar)
+            if isinstance(result, tuple):
+                outputs, batch = result
+            else:
+                outputs, batch = result, batch
+        else:
+            outputs, batch = result
         lidar_metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
         assert not set(lidar_metrics_dict.keys()).intersection(metrics_dict.keys())
         metrics_dict.update(lidar_metrics_dict)
@@ -295,7 +304,16 @@ class ADPipeline(VanillaPipeline):
             for lidar, batch in self.datamanager.fixed_indices_eval_lidar_dataloader:
                 torch.cuda.synchronize()
                 inner_start = time()
-                outputs, batch = self.model.get_outputs_for_lidar(lidar, batch=batch)
+                try:
+                    result = self.model.get_outputs_for_lidar(lidar, batch=batch)
+                except TypeError:
+                    result = self.model.get_outputs_for_lidar(lidar)
+                    if isinstance(result, tuple):
+                        outputs, batch = result
+                    else:
+                        outputs, batch = result, batch
+                else:
+                    outputs, batch = result
                 torch.cuda.synchronize()
                 inference_time_lidar = time() - inner_start
                 metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)

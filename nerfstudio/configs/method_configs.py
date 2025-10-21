@@ -456,9 +456,6 @@ Add SplatGUT method configurations.
 Append this to the existing method_configs.py file.
 """
 
-# ============================================================================
-# SplatGUT: SplatAD with 3DGUT Ray Tracing
-# ============================================================================
 
 # ============================================================================
 # SplatGUT: SplatAD with 3DGUT Ray Tracing

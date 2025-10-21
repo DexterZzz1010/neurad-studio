@@ -133,7 +133,7 @@ class NuScenesDataParserConfig(ADDataParserConfig):
     """Directory specifying location of data."""
     sequence: str = "0103"
     """Name of the scene."""
-    version: Literal["v1.0-mini", "v1.0-trainval"] = "v1.0-trainval"
+    version: Literal["v1.0-mini", "v1.0-trainval"] = "v1.0-mini"
     """Dataset version."""
     cameras: Tuple[
         Literal[

@@ -110,16 +110,28 @@ class GaussiansWrapper:
         device = model.means.device
         dtype = torch.float32
 
-        # ============ POSITIONS: normalize ============
+        # ============ POSITIONS / NORMALIZATION ============
         cfg = getattr(model, "config", None)
         target_radius = float(getattr(cfg, "target_radius", 200.0))
+        disable_norm = bool(getattr(cfg, "disable_normalization", False))
 
         raw_means = override_means if override_means is not None else model.means
         if not raw_means.is_cuda or raw_means.dtype != dtype:
             raw_means = raw_means.to(device=device, dtype=dtype)
 
-        self.positions, self.normalization_center, self.normalization_scale = \
-            self._normalize_positions_to_radius(raw_means, target_radius)
+        if disable_norm:
+            self.positions = raw_means.contiguous()
+            self.normalization_center = torch.zeros(3, device=device, dtype=dtype)
+            self.normalization_scale = torch.ones(1, device=device, dtype=dtype)
+        else:
+            # Fallback to a sensible radius if the provided value is degenerate.
+            if not torch.isfinite(torch.tensor(target_radius)) or target_radius <= 0:
+                target_radius = 200.0
+            (
+                self.positions,
+                self.normalization_center,
+                self.normalization_scale,
+            ) = self._normalize_positions_to_radius(raw_means, target_radius)
 
         assert self.positions.device == device and self.positions.dtype == dtype
         assert self.positions.is_contiguous()
@@ -133,8 +145,10 @@ class GaussiansWrapper:
 
         norm_scale = self.normalization_scale.to(dtype=dtype, device=device)
         log_scale = model.scales.to(dtype=dtype, device=device)
-        log_scale_clamped = torch.clamp(log_scale, min=-10, max=5)
-        scl = torch.exp(log_scale_clamped) * norm_scale
+        log_norm_scale = torch.log(norm_scale.clamp_min(1e-8))
+        log_scale_normalized = log_scale + log_norm_scale
+        log_scale_clamped = torch.clamp(log_scale_normalized, min=-10, max=5)
+        scl = torch.exp(log_scale_clamped)
         assert torch.isfinite(scl).all() and (scl > 0).all()
         self.scale = scl.contiguous()
 
