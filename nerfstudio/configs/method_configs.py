@@ -40,6 +40,7 @@ from nerfstudio.models.lidar_nerfacto import LidarNerfactoModelConfig
 from nerfstudio.models.nerfacto import NerfactoModelConfig
 from nerfstudio.models.neurad import NeuRADModelConfig
 from nerfstudio.models.splatad import SplatADModelConfig
+from nerfstudio.models.splatgut import SplatGUTModelConfig
 from nerfstudio.models.splatfacto import SplatfactoModelConfig
 from nerfstudio.pipelines.ad_pipeline import ADPipelineConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
@@ -54,6 +55,7 @@ descriptions = {
     "neurad": "Continuously improving version of NeuRAD.",
     "neurad-paper": "NeuRAD with settings matching the paper.",
     "splatad": "Gaussian Splatting model for autonomous driving",
+    "splatgut": "SplatAD + 3DGUT for distortion-aware Gaussian Splatting",
 }
 
 method_configs["nerfacto"] = TrainerConfig(
@@ -390,6 +392,17 @@ method_configs["splatad"] = TrainerConfig(
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
+)
+
+method_configs["splatgut"] = deepcopy(method_configs["splatad"])
+method_configs["splatgut"].method_name = "splatgut"
+assert isinstance(method_configs["splatgut"].pipeline, SplatADPipelineConfig)
+method_configs["splatgut"].pipeline.model = SplatGUTModelConfig(  # type: ignore[assignment]
+    max_steps=30001,
+    with_ut=True,
+    with_eval3d=False,
+    camera_model="pinhole",
+    sh_degree=3,
 )
 
 method_configs["neurad"] = TrainerConfig(
