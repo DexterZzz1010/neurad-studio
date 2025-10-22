@@ -31,7 +31,7 @@ class SplatGUTModelConfig(SplatADModelConfig):
     with_ut: bool = True
     """Enable Unscented Transform projection."""
 
-    with_eval3d: bool = False
+    with_eval3d: bool = True
     """Evaluate splats in 3D (slower but more accurate)."""
 
     camera_model: Literal["pinhole", "fisheye", "ortho", "ftheta"] = "pinhole"
@@ -108,9 +108,9 @@ class SplatGUTModel(SplatADModel):
         means, _ = self._get_actor_adjusted_means(self.means, camera_times, self.id, calc_vels=False)
 
         colors = torch.cat((self.features_dc, self.features_rest), dim=-1)
-        sh_coeffs = colors @ self.feature_to_sh_proj.to(dtype=colors.dtype, device=colors.device)
-        sh_coeffs = sh_coeffs.view(-1, self._num_sh_coeffs, 3)
-
+        rgb = colors @ self.feature_to_sh_proj.to(dtype=colors.dtype, device=colors.device)
+        # sh_coeffs = sh_coeffs.view(-1, self._num_sh_coeffs, 3)
+        rgb = rgb.view(-1, 3)
         background = self._get_background_color()
         raster_kwargs = self._build_distortion_kwargs(camera)
 
@@ -119,7 +119,7 @@ class SplatGUTModel(SplatADModel):
             quats=self.quats,
             scales=torch.exp(self.scales),
             opacities=torch.sigmoid(self.opacities).squeeze(-1),
-            colors=sh_coeffs,
+            colors=rgb,
             viewmats=viewmat,
             Ks=K,
             width=W,
@@ -128,7 +128,7 @@ class SplatGUTModel(SplatADModel):
             far_plane=1e10,
             radius_clip=self.config.radius_clip_pix,
             eps2d=0.3,
-            sh_degree=self.config.sh_degree,
+            sh_degree=None,
             packed=False,
             tile_size=16,
             backgrounds=None,

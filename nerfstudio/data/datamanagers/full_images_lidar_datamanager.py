@@ -82,7 +82,7 @@ class FullImageLidarDatamanagerConfig(FullImageDatamanagerConfig):
     For example, 2 means the two closest of every camera (2 front, 2 left, 2 right, etc)."""
     train_lidar_only: bool = False
     """Whether to only train on lidar data."""
-    train_image_only: bool = False
+    train_image_only: bool = True
     """Whether to only train on image data."""
 
 

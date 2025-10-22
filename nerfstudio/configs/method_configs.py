@@ -400,9 +400,13 @@ assert isinstance(method_configs["splatgut"].pipeline, SplatADPipelineConfig)
 method_configs["splatgut"].pipeline.model = SplatGUTModelConfig(  # type: ignore[assignment]
     max_steps=30001,
     with_ut=True,
-    with_eval3d=False,
+    with_eval3d=True,
     camera_model="pinhole",
-    sh_degree=3,
+    sh_degree=0,
+    strategy="mcmc",
+    mcmc_cap_max=7_500_000,
+    mcmc_noise_lr=6e5,
+    mcmc_min_opacity=0.003,
 )
 
 method_configs["neurad"] = TrainerConfig(
