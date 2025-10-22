@@ -12,7 +12,11 @@ import torch
 from typing_extensions import Literal
 
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.models.splatad import SplatADModel, SplatADModelConfig
+from nerfstudio.models.splatad import (
+    SplatADModel,
+    SplatADModelConfig,
+    get_ray_dirs_pinhole,
+)
 from nerfstudio.models.splatfacto import get_viewmat
 
 try:
@@ -31,7 +35,7 @@ class SplatGUTModelConfig(SplatADModelConfig):
     with_ut: bool = True
     """Enable Unscented Transform projection."""
 
-    with_eval3d: bool = False
+    with_eval3d: bool = True
     """Evaluate splats in 3D (slower but more accurate)."""
 
     camera_model: Literal["pinhole", "fisheye", "ortho", "ftheta"] = "pinhole"
@@ -102,6 +106,7 @@ class SplatGUTModel(SplatADModel):
         K = camera.get_intrinsics_matrices()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
+        ray_dirs = get_ray_dirs_pinhole(camera, W, H, optimized_camera_to_world)
         if camera_scale_fac != 1:
             camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
@@ -170,16 +175,22 @@ class SplatGUTModel(SplatADModel):
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
             )
 
-        rgb = render[..., :3]
-        rgb = rgb + (1 - alpha) * background.view(1, 1, 1, 3)
-        rgb = torch.clamp(rgb, 0.0, 1.0)
-
-        depth_im: Optional[torch.Tensor]
-        if render_mode == "RGB+ED":
-            depth_im = render[..., -1:]
-            depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max())
-        else:
+        if self.config.with_eval3d:
+            reconstructed_features = render[..., :3] @ self.feature_projection.transpose(0, 1)
+            appearance_features = self._get_appearance_embedding(camera, reconstructed_features)
+            decoder_input = torch.cat((reconstructed_features, appearance_features), dim=-1)
+            rgb = self.rgb_decoder(decoder_input, ray_dirs.unsqueeze(0))
+            rgb = rgb + (1 - alpha) * background
             depth_im = None
+        else:
+            rgb = render[..., :3]
+            if render_mode == "RGB+ED":
+                depth_im = render[..., -1:]
+                depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max())
+            else:
+                depth_im = None
+            rgb = rgb + (1 - alpha) * background.view(1, 1, 1, 3)
+        rgb = torch.clamp(rgb, 0.0, 1.0)
 
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
