@@ -31,14 +31,14 @@ class SplatGUTModelConfig(SplatADModelConfig):
     with_ut: bool = True
     """Enable Unscented Transform projection."""
 
-    with_eval3d: bool = True
+    with_eval3d: bool = False
     """Evaluate splats in 3D (slower but more accurate)."""
 
     camera_model: Literal["pinhole", "fisheye", "ortho", "ftheta"] = "pinhole"
     """Camera model passed to the 3DGUT rasterizer."""
 
-    sh_degree: int = 3
-    """Spherical harmonic degree provided to the rasterizer (3DGUT supports up to 3)."""
+    sh_degree: Optional[int] = 3
+    """Optional spherical harmonic degree; None means direct RGB colors are used."""
 
 
 class SplatGUTModel(SplatADModel):
@@ -53,11 +53,15 @@ class SplatGUTModel(SplatADModel):
         **kwargs,
     ):
         super().__init__(*args, seed_points=seed_points, **kwargs)
-        self._num_sh_coeffs = (self.config.sh_degree + 1) ** 2
         feature_dim = int(self.features_dc.shape[-1] + self.features_rest.shape[-1])
-        out_dim = self._num_sh_coeffs * 3
-        feature_to_sh = self._generate_orthogonal_projection(feature_dim, out_dim)
-        self.register_buffer("feature_to_sh_proj", feature_to_sh)
+        if self.config.sh_degree is not None:
+            self._num_sh_coeffs: Optional[int] = (self.config.sh_degree + 1) ** 2
+            out_dim = self._num_sh_coeffs * 3
+        else:
+            self._num_sh_coeffs = None
+            out_dim = 3
+        feature_projection = self._generate_orthogonal_projection(feature_dim, out_dim)
+        self.register_buffer("feature_projection", feature_projection)
 
     @staticmethod
     def _generate_orthogonal_projection(in_dim: int, out_dim: int) -> torch.Tensor:
@@ -101,16 +105,26 @@ class SplatGUTModel(SplatADModel):
         if camera_scale_fac != 1:
             camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
-        render_mode = "RGB+ED" if self.config.output_depth_during_training or not self.training else "RGB"
+        render_mode = (
+            "RGB"
+            if self.config.with_eval3d
+            else ("RGB+ED" if self.config.output_depth_during_training or not self.training else "RGB")
+        )
 
         viewmat = get_viewmat(optimized_camera_to_world)
         camera_times = camera.times
         means, _ = self._get_actor_adjusted_means(self.means, camera_times, self.id, calc_vels=False)
 
         colors = torch.cat((self.features_dc, self.features_rest), dim=-1)
-        rgb = colors @ self.feature_to_sh_proj.to(dtype=colors.dtype, device=colors.device)
-        # sh_coeffs = sh_coeffs.view(-1, self._num_sh_coeffs, 3)
-        rgb = rgb.view(-1, 3)
+        projected = colors @ self.feature_projection.to(dtype=colors.dtype, device=colors.device)
+        if self.config.sh_degree is None:
+            colors_arg = projected.view(-1, 3)
+            sh_degree = None
+        else:
+            assert self._num_sh_coeffs is not None
+            colors_arg = projected.view(-1, self._num_sh_coeffs, 3)
+            sh_degree = self.config.sh_degree
+
         background = self._get_background_color()
         raster_kwargs = self._build_distortion_kwargs(camera)
 
@@ -119,7 +133,7 @@ class SplatGUTModel(SplatADModel):
             quats=self.quats,
             scales=torch.exp(self.scales),
             opacities=torch.sigmoid(self.opacities).squeeze(-1),
-            colors=rgb,
+            colors=colors_arg,
             viewmats=viewmat,
             Ks=K,
             width=W,
@@ -128,7 +142,7 @@ class SplatGUTModel(SplatADModel):
             far_plane=1e10,
             radius_clip=self.config.radius_clip_pix,
             eps2d=0.3,
-            sh_degree=None,
+            sh_degree=sh_degree,
             packed=False,
             tile_size=16,
             backgrounds=None,
