@@ -7,7 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, Union
 
-import numpy as np
 import torch
 from typing_extensions import Literal
 
@@ -57,41 +56,23 @@ class SplatGUTModel(SplatADModel):
         **kwargs,
     ):
         super().__init__(*args, seed_points=seed_points, **kwargs)
+        self._num_sh_coeffs = (self.config.sh_degree + 1) ** 2
         feature_dim = int(self.features_dc.shape[-1] + self.features_rest.shape[-1])
-        if self.config.sh_degree is not None:
-            self._num_sh_coeffs: Optional[int] = (self.config.sh_degree + 1) ** 2
-            out_dim = self._num_sh_coeffs * 3
-            feature_projection = self._generate_orthogonal_projection(feature_dim, out_dim)
-            self.register_buffer("feature_projection", feature_projection)
-        else:
-            self._num_sh_coeffs = None
-            if self.config.with_eval3d:
-                feature_projection = self._generate_orthogonal_projection(feature_dim, 3)
-                self.register_buffer("feature_projection", feature_projection)
-            else:
-                self.register_buffer("feature_projection", None)
+        sh_dim = self._num_sh_coeffs * 3
+        projection = self._build_fixed_projection(feature_dim, sh_dim, device=self.features_dc.device)
+        projection_pinv = torch.linalg.pinv(projection)
+        self.register_buffer("feature_to_sh_proj", projection)
+        self.register_buffer("feature_to_sh_pinv", projection_pinv)
 
     @staticmethod
-    def _generate_orthogonal_projection(in_dim: int, out_dim: int) -> torch.Tensor:
-        """Returns a deterministic projection matrix with orthonormal rows."""
+    def _build_fixed_projection(in_dim: int, out_dim: int, device: Union[torch.device, str]) -> torch.Tensor:
+        """Construct a deterministic projection matrix from feature space to SH space."""
         if in_dim <= 0 or out_dim <= 0:
             raise ValueError("Projection dimensions must be positive.")
-        rng = np.random.default_rng(seed=42)
-        if in_dim >= out_dim:
-            A = rng.standard_normal((in_dim, out_dim)).astype(np.float32)
-            Q, R = np.linalg.qr(A)
-            diag = np.sign(np.diag(R))
-            diag[diag == 0] = 1
-            Q = Q * diag
-            proj = Q.astype(np.float32)
-        else:
-            A = rng.standard_normal((out_dim, in_dim)).astype(np.float32)
-            Q, R = np.linalg.qr(A)
-            diag = np.sign(np.diag(R))
-            diag[diag == 0] = 1
-            Q = Q * diag
-            proj = Q.T.astype(np.float32)
-        return torch.from_numpy(proj)
+        idx = torch.arange(in_dim, dtype=torch.float32, device=device).unsqueeze(1)
+        jdx = torch.arange(out_dim, dtype=torch.float32, device=device).unsqueeze(0)
+        base = torch.sin((idx + 1.0) * (jdx + 1.0) / torch.sqrt(torch.tensor(float(in_dim * out_dim), device=device)))
+        return base.contiguous()
 
     def get_camera_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Render RGB images with 3DGUT rasterization."""
@@ -124,19 +105,11 @@ class SplatGUTModel(SplatADModel):
         camera_times = camera.times
         means, _ = self._get_actor_adjusted_means(self.means, camera_times, self.id, calc_vels=False)
 
-        colors = torch.cat((self.features_dc, self.features_rest), dim=-1)
-        if self._num_sh_coeffs is not None:
-            assert self.feature_projection is not None
-            projected = colors @ self.feature_projection.to(dtype=colors.dtype, device=colors.device)
-            colors_arg = projected.view(-1, self._num_sh_coeffs, 3)
-            sh_degree = self.config.sh_degree
-        elif self.config.with_eval3d:
-            assert self.feature_projection is not None
-            colors_arg = colors @ self.feature_projection.to(dtype=colors.dtype, device=colors.device)
-            sh_degree = None
-        else:
-            colors_arg = colors
-            sh_degree = None
+        features = torch.cat((self.features_dc, self.features_rest), dim=-1)
+        projection = self.feature_to_sh_proj.to(dtype=features.dtype, device=features.device)
+        sh_flat = features @ projection
+        colors_arg = sh_flat.view(-1, self._num_sh_coeffs, 3)
+        sh_degree = self.config.sh_degree
 
         background = self._get_background_color()
         raster_kwargs = self._build_distortion_kwargs(camera)
@@ -183,30 +156,20 @@ class SplatGUTModel(SplatADModel):
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
             )
 
-        if self.config.with_eval3d:
-            if self._num_sh_coeffs is not None:
-                raise RuntimeError(
-                    "Feature reconstruction with eval3d currently requires sh_degree to be None."
-                )
-            assert self.feature_projection is not None
-            projection = self.feature_projection.to(dtype=render.dtype, device=render.device)
-            reconstructed_features = render[..., : projection.shape[-1]] @ projection.transpose(0, 1)
-            appearance_features = self._get_appearance_embedding(camera, reconstructed_features)
-            decoder_input = torch.cat((reconstructed_features, appearance_features), dim=-1)
-            rgb = self.rgb_decoder(decoder_input, ray_dirs.unsqueeze(0))
-            rgb = rgb + (1 - alpha) * background
-            depth_im = None
+        if render_mode == "RGB+ED":
+            sh_rendered = render[..., :-1]
+            depth_im = render[..., -1:]
+            depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max())
         else:
-            rendered_features = render[..., :-1] if render_mode == "RGB+ED" else render
-            appearance_features = self._get_appearance_embedding(camera, rendered_features)
-            decoder_input = torch.cat((rendered_features, appearance_features), dim=-1)
-            rgb = self.rgb_decoder(decoder_input, ray_dirs.unsqueeze(0))
-            rgb = rgb + (1 - alpha) * background
-            if render_mode == "RGB+ED":
-                depth_im = render[..., -1:]
-                depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max())
-            else:
-                depth_im = None
+            sh_rendered = render
+            depth_im = None
+
+        projection_pinv = self.feature_to_sh_pinv.to(dtype=sh_rendered.dtype, device=sh_rendered.device)
+        reconstructed_features = sh_rendered @ projection_pinv
+        appearance_features = self._get_appearance_embedding(camera, reconstructed_features)
+        decoder_input = torch.cat((reconstructed_features, appearance_features), dim=-1)
+        rgb = self.rgb_decoder(decoder_input, ray_dirs.unsqueeze(0))
+        rgb = rgb + (1 - alpha) * background.view(1, 1, 1, 3)
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
         if background.shape[0] == 3 and not self.training:
