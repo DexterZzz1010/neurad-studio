@@ -418,7 +418,7 @@ method_configs["splatgut"].optimizers = {
     },
     "features_dc": {
         # SH 颜色系数，参考 gsplat 官方设置
-        "optimizer": AdamOptimizerConfig(lr=0.00001, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
         "scheduler": None,
     },
     "features_rest": {
