@@ -408,6 +408,71 @@ method_configs["splatgut"].pipeline.model = SplatGUTModelConfig(  # type: ignore
     mcmc_noise_lr=6e5,
     mcmc_min_opacity=0.003,
 )
+method_configs["splatgut"].optimizers = {
+    "means": {
+        "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=1.6e-6,
+            max_steps=30000,
+        ),
+    },
+    "features_dc": {
+        # SH 颜色系数，参考 gsplat 官方设置
+        "optimizer": AdamOptimizerConfig(lr=0.00001, eps=1e-15),
+        "scheduler": None,
+    },
+    "features_rest": {
+        # 雷达特征
+        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+        "scheduler": None,
+    },
+    "opacities": {
+        "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+        "scheduler": None,
+    },
+    "scales": {
+        "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
+        "scheduler": None,
+    },
+    "quats": {
+        "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+        "scheduler": None,
+    },
+    "camera_opt": {
+        "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=5e-7,
+            max_steps=30000,
+        ),
+    },
+    # 其他组（如相机速度、轨迹、fields）可按需要保留或复制 splatad 的默认值
+    "camera_velocity_opt_linear": {
+        "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+        ),
+    },
+    "camera_velocity_opt_angular": {
+        "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=1e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+        ),
+    },
+    "camera_velocity_opt_time_to_center_pixel": {
+        "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=1e-7, max_steps=30000, warmup_steps=10000, lr_pre_warmup=0
+        ),
+    },
+    "trajectory_opt": {
+        "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
+    },
+    "fields": {
+        "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
+        "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
+    },
+}
 
 method_configs["neurad"] = TrainerConfig(
     method_name="neurad",
