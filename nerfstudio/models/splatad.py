@@ -62,6 +62,13 @@ try:
 except ImportError:
     print("Please install gsplat>=1.0.0")
 
+try:
+    from gsplat_original.cuda._wrapper import RollingShutterType
+    from gsplat_original.rendering import rasterization as gut_rasterization
+except ImportError as exc:  # pragma: no cover - optional dependency
+    raise ImportError("Please install the gsplat_original package with 3DGUT support.") from exc
+
+
 
 def random_quat_tensor(N):
     """
