@@ -38,6 +38,19 @@ class DynamicActorsConfig(InstantiateConfig):
     """Whether to optimize the trajectories or not."""
     actor_bbox_padding: Tuple[float, float, float] = (0.25, 0.25, 0.1)
     """Padding to add to the bounding boxes of the actors (wlh order, in meters)."""
+    enabled: bool = True
+    """If False, dynamic actors are disabled and scenes are treated as static."""
+
+    def setup(self, trajectories: Optional[List[dict]] = None, **kwargs) -> "DynamicActors":
+        """Instantiate the dynamic actors helper.
+
+        When disabled, return an empty DynamicActors instance by forcing trajectories to [].
+        """
+        if not self.enabled:
+            trajectories = []
+        if trajectories is None:
+            trajectories = []
+        return super().setup(trajectories=trajectories, **kwargs)
 
 
 class DynamicActors(nn.Module):

@@ -52,15 +52,6 @@ class SplatGUTModel(SplatADModel):
 
     config: SplatGUTModelConfig
 
-    def __init__(
-        self,
-        *args,
-        seed_points: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        **kwargs,
-    ):
-        super().__init__(*args, seed_points=seed_points, **kwargs)
-        self._num_sh_coeffs = (self.config.sh_degree + 1) ** 2
-
     def create_gauss_param_dict(
         self,
         dyn_seed_points_list: List[torch.Tensor],
@@ -72,6 +63,7 @@ class SplatGUTModel(SplatADModel):
             dyn_seed_points_list, static_seed_points_list, flip_actors_at_init=flip_actors_at_init
         )
 
+        self._num_sh_coeffs = (self.config.sh_degree + 1) ** 2
         features_dc_param = param_dict["features_dc"]
         num_gauss = features_dc_param.shape[0]
         device = features_dc_param.device
