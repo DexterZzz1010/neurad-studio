@@ -402,6 +402,7 @@ method_configs["splatgut"].pipeline.model = SplatGUTModelConfig(  # type: ignore
     with_ut=True,
     with_eval3d=True,
     camera_model="pinhole",
+    lidar_feature_dim=13,
     strategy="mcmc",
     mcmc_cap_max=7_500_000,
     mcmc_noise_lr=6e5,
