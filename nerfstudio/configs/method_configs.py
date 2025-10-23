@@ -401,6 +401,7 @@ method_configs["splatgut"].pipeline.model = SplatGUTModelConfig(  # type: ignore
     max_steps=30001,
     with_ut=True,
     with_eval3d=True,
+    sh_degree=None,
     camera_model="pinhole",
     strategy="mcmc",
     mcmc_cap_max=7_500_000,

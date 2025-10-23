@@ -35,7 +35,7 @@ class SplatGUTModelConfig(SplatADModelConfig):
     with_ut: bool = True
     """Enable Unscented Transform projection."""
 
-    with_eval3d: bool = True
+    with_eval3d: bool = False
     """Evaluate splats in 3D (slower but more accurate)."""
 
     camera_model: Literal["pinhole", "fisheye", "ortho", "ftheta"] = "pinhole"
@@ -61,11 +61,15 @@ class SplatGUTModel(SplatADModel):
         if self.config.sh_degree is not None:
             self._num_sh_coeffs: Optional[int] = (self.config.sh_degree + 1) ** 2
             out_dim = self._num_sh_coeffs * 3
+            feature_projection = self._generate_orthogonal_projection(feature_dim, out_dim)
+            self.register_buffer("feature_projection", feature_projection)
         else:
             self._num_sh_coeffs = None
-            out_dim = 3
-        feature_projection = self._generate_orthogonal_projection(feature_dim, out_dim)
-        self.register_buffer("feature_projection", feature_projection)
+            if self.config.with_eval3d:
+                feature_projection = self._generate_orthogonal_projection(feature_dim, 3)
+                self.register_buffer("feature_projection", feature_projection)
+            else:
+                self.register_buffer("feature_projection", None)
 
     @staticmethod
     def _generate_orthogonal_projection(in_dim: int, out_dim: int) -> torch.Tensor:
@@ -121,14 +125,18 @@ class SplatGUTModel(SplatADModel):
         means, _ = self._get_actor_adjusted_means(self.means, camera_times, self.id, calc_vels=False)
 
         colors = torch.cat((self.features_dc, self.features_rest), dim=-1)
-        projected = colors @ self.feature_projection.to(dtype=colors.dtype, device=colors.device)
-        if self.config.sh_degree is None:
-            colors_arg = projected.view(-1, 3)
-            sh_degree = None
-        else:
-            assert self._num_sh_coeffs is not None
+        if self._num_sh_coeffs is not None:
+            assert self.feature_projection is not None
+            projected = colors @ self.feature_projection.to(dtype=colors.dtype, device=colors.device)
             colors_arg = projected.view(-1, self._num_sh_coeffs, 3)
             sh_degree = self.config.sh_degree
+        elif self.config.with_eval3d:
+            assert self.feature_projection is not None
+            colors_arg = colors @ self.feature_projection.to(dtype=colors.dtype, device=colors.device)
+            sh_degree = None
+        else:
+            colors_arg = colors
+            sh_degree = None
 
         background = self._get_background_color()
         raster_kwargs = self._build_distortion_kwargs(camera)
@@ -176,20 +184,29 @@ class SplatGUTModel(SplatADModel):
             )
 
         if self.config.with_eval3d:
-            reconstructed_features = render[..., :3] @ self.feature_projection.transpose(0, 1)
+            if self._num_sh_coeffs is not None:
+                raise RuntimeError(
+                    "Feature reconstruction with eval3d currently requires sh_degree to be None."
+                )
+            assert self.feature_projection is not None
+            projection = self.feature_projection.to(dtype=render.dtype, device=render.device)
+            reconstructed_features = render[..., : projection.shape[-1]] @ projection.transpose(0, 1)
             appearance_features = self._get_appearance_embedding(camera, reconstructed_features)
             decoder_input = torch.cat((reconstructed_features, appearance_features), dim=-1)
             rgb = self.rgb_decoder(decoder_input, ray_dirs.unsqueeze(0))
             rgb = rgb + (1 - alpha) * background
             depth_im = None
         else:
-            rgb = render[..., :3]
+            rendered_features = render[..., :-1] if render_mode == "RGB+ED" else render
+            appearance_features = self._get_appearance_embedding(camera, rendered_features)
+            decoder_input = torch.cat((rendered_features, appearance_features), dim=-1)
+            rgb = self.rgb_decoder(decoder_input, ray_dirs.unsqueeze(0))
+            rgb = rgb + (1 - alpha) * background
             if render_mode == "RGB+ED":
                 depth_im = render[..., -1:]
                 depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max())
             else:
                 depth_im = None
-            rgb = rgb + (1 - alpha) * background.view(1, 1, 1, 3)
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
         if background.shape[0] == 3 and not self.training:
