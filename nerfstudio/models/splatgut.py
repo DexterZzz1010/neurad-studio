@@ -7,7 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, Union
 
-import numpy as np
 import torch
 from typing_extensions import Literal
 
@@ -32,16 +31,16 @@ class SplatGUTModelConfig(SplatADModelConfig):
 
     _target: Type = field(default_factory=lambda: SplatGUTModel)
 
-    with_ut: bool = True
+    with_ut: bool = False
     """Enable Unscented Transform projection."""
 
-    with_eval3d: bool = True
+    with_eval3d: bool = False
     """Evaluate splats in 3D (slower but more accurate)."""
 
     camera_model: Literal["pinhole", "fisheye", "ortho", "ftheta"] = "pinhole"
     """Camera model passed to the 3DGUT rasterizer."""
 
-    sh_degree: Optional[int] = 3
+    sh_degree: Optional[int] = None
     """Optional spherical harmonic degree; None means direct RGB colors are used."""
 
 
@@ -69,25 +68,13 @@ class SplatGUTModel(SplatADModel):
 
     @staticmethod
     def _generate_orthogonal_projection(in_dim: int, out_dim: int) -> torch.Tensor:
-        """Returns a deterministic projection matrix with orthonormal rows."""
+        """Returns a deterministic projection matrix independent of randomness."""
         if in_dim <= 0 or out_dim <= 0:
             raise ValueError("Projection dimensions must be positive.")
-        rng = np.random.default_rng(seed=42)
-        if in_dim >= out_dim:
-            A = rng.standard_normal((in_dim, out_dim)).astype(np.float32)
-            Q, R = np.linalg.qr(A)
-            diag = np.sign(np.diag(R))
-            diag[diag == 0] = 1
-            Q = Q * diag
-            proj = Q.astype(np.float32)
-        else:
-            A = rng.standard_normal((out_dim, in_dim)).astype(np.float32)
-            Q, R = np.linalg.qr(A)
-            diag = np.sign(np.diag(R))
-            diag[diag == 0] = 1
-            Q = Q * diag
-            proj = Q.T.astype(np.float32)
-        return torch.from_numpy(proj)
+        idx = torch.arange(in_dim, dtype=torch.float32).unsqueeze(1)
+        jdx = torch.arange(out_dim, dtype=torch.float32).unsqueeze(0)
+        base = torch.sin((idx + 1.0) * (jdx + 1.0) / torch.sqrt(torch.tensor(float(in_dim * out_dim), dtype=torch.float32)))
+        return base.contiguous()
 
     def get_camera_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Render RGB images with 3DGUT rasterization."""
