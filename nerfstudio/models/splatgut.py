@@ -7,15 +7,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type, Union
 
+import numpy as np
 import torch
 from typing_extensions import Literal
 
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.models.splatad import (
-    SplatADModel,
-    SplatADModelConfig,
-    get_ray_dirs_pinhole,
-)
+from nerfstudio.models.splatad import SplatADModel, SplatADModelConfig
 from nerfstudio.models.splatfacto import get_viewmat
 
 try:
@@ -31,16 +28,16 @@ class SplatGUTModelConfig(SplatADModelConfig):
 
     _target: Type = field(default_factory=lambda: SplatGUTModel)
 
-    with_ut: bool = False
+    with_ut: bool = True
     """Enable Unscented Transform projection."""
 
-    with_eval3d: bool = False
+    with_eval3d: bool = True
     """Evaluate splats in 3D (slower but more accurate)."""
 
     camera_model: Literal["pinhole", "fisheye", "ortho", "ftheta"] = "pinhole"
     """Camera model passed to the 3DGUT rasterizer."""
 
-    sh_degree: Optional[int] = None
+    sh_degree: Optional[int] = 3
     """Optional spherical harmonic degree; None means direct RGB colors are used."""
 
 
@@ -74,8 +71,8 @@ class SplatGUTModel(SplatADModel):
         idx = torch.arange(in_dim, dtype=torch.float32).unsqueeze(1)
         jdx = torch.arange(out_dim, dtype=torch.float32).unsqueeze(0)
         base = torch.sin((idx + 1.0) * (jdx + 1.0) / torch.sqrt(torch.tensor(float(in_dim * out_dim), dtype=torch.float32)))
-        return base.contiguous()
 
+        return base.contiguous()
     def get_camera_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Render RGB images with 3DGUT rasterization."""
         if not isinstance(camera, Cameras):
@@ -93,7 +90,6 @@ class SplatGUTModel(SplatADModel):
         K = camera.get_intrinsics_matrices()
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
-        ray_dirs = get_ray_dirs_pinhole(camera, W, H, optimized_camera_to_world)
         if camera_scale_fac != 1:
             camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
 
@@ -162,22 +158,16 @@ class SplatGUTModel(SplatADModel):
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
             )
 
-        if self.config.with_eval3d:
-            reconstructed_features = render[..., :3] @ self.feature_projection.transpose(0, 1)
-            appearance_features = self._get_appearance_embedding(camera, reconstructed_features)
-            decoder_input = torch.cat((reconstructed_features, appearance_features), dim=-1)
-            rgb = self.rgb_decoder(decoder_input, ray_dirs.unsqueeze(0))
-            rgb = rgb + (1 - alpha) * background
-            depth_im = None
-        else:
-            rgb = render[..., :3]
-            if render_mode == "RGB+ED":
-                depth_im = render[..., -1:]
-                depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max())
-            else:
-                depth_im = None
-            rgb = rgb + (1 - alpha) * background.view(1, 1, 1, 3)
+        rgb = render[..., :3]
+        rgb = rgb + (1 - alpha) * background.view(1, 1, 1, 3)
         rgb = torch.clamp(rgb, 0.0, 1.0)
+
+        depth_im: Optional[torch.Tensor]
+        if render_mode == "RGB+ED":
+            depth_im = render[..., -1:]
+            depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max())
+        else:
+            depth_im = None
 
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
