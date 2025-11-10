@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Union
 
 import torch
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat.strategy.ops import remove, reset_opa
+from gsplat_original.strategy import DefaultStrategy, MCMCStrategy
+from gsplat_original.strategy.ops import remove, reset_opa
 
+# from gsplat.strategy import DefaultStrategy, MCMCStrategy
+# from gsplat.strategy.ops import remove, reset_opa
 
 @dataclass
 class ADDefaultStrategy(DefaultStrategy):

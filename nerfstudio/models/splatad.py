@@ -209,7 +209,7 @@ class SplatADModelConfig(ADModelConfig):
     """weight of ssim loss"""
     stop_split_at: int = 15000
     """stop splitting at this step"""
-    mcmc_scale_reg_lambda: float = 0.001
+    mcmc_scale_reg_lambda: float = 0.0001
     """weight of scale regularization loss"""
     mcmc_opacity_reg_lambda: float = 0.005
     """weight of opacity regularization loss"""
@@ -333,6 +333,8 @@ class SplatADModel(ADModel):
             [static_points],
             flip_actors_at_init=self.config.flip_actors_at_init,
         )
+        # Ensure bookkeeping ids and other frozen params stay frozen even if intermediate ops re-wrap Parameters.
+        self.gauss_params["id"].requires_grad_(False)
 
         dataset_metadata = self.kwargs["metadata"]
         num_sensors = len(dataset_metadata["sensor_idx_to_name"])
@@ -538,8 +540,11 @@ class SplatADModel(ADModel):
         for name, param in self.gauss_params.items():
             old_shape = param.shape
             new_shape = (newp,) + old_shape[1:]
-            self.gauss_params[name] = torch.nn.Parameter(torch.zeros(new_shape, device=self.device))
+            self.gauss_params[name] = torch.nn.Parameter(
+                torch.zeros(new_shape, device=self.device), requires_grad=param.requires_grad
+            )
         super().load_state_dict(dict, **kwargs)
+        self.gauss_params["id"].requires_grad_(False)
 
     def create_gauss_param_dict(
         self,
@@ -600,13 +605,19 @@ class SplatADModel(ADModel):
                 mirrored_means[:, 0] *= -1
                 mirrored_quats = quats.clone()
                 mirrored_quats[:, 1] *= -1
-                means = torch.nn.Parameter(torch.cat([means, mirrored_means], dim=0))
-                scales = torch.nn.Parameter(torch.cat([scales, scales.clone()], dim=0))
-                quats = torch.nn.Parameter(torch.cat([quats, mirrored_quats], dim=0))
-                features_dc = torch.nn.Parameter(torch.cat([features_dc, features_dc.clone()], dim=0))
-                features_rest = torch.nn.Parameter(torch.cat([features_rest, features_rest.clone()], dim=0))
-                opacities = torch.nn.Parameter(torch.cat([opacities, opacities.clone()], dim=0))
-                ids = torch.nn.Parameter(torch.cat([ids, ids.clone()], dim=0))
+                means = torch.nn.Parameter(torch.cat([means, mirrored_means], dim=0), requires_grad=means.requires_grad)
+                scales = torch.nn.Parameter(torch.cat([scales, scales.clone()], dim=0), requires_grad=scales.requires_grad)
+                quats = torch.nn.Parameter(torch.cat([quats, mirrored_quats], dim=0), requires_grad=quats.requires_grad)
+                features_dc = torch.nn.Parameter(
+                    torch.cat([features_dc, features_dc.clone()], dim=0), requires_grad=features_dc.requires_grad
+                )
+                features_rest = torch.nn.Parameter(
+                    torch.cat([features_rest, features_rest.clone()], dim=0), requires_grad=features_rest.requires_grad
+                )
+                opacities = torch.nn.Parameter(
+                    torch.cat([opacities, opacities.clone()], dim=0), requires_grad=opacities.requires_grad
+                )
+                ids = torch.nn.Parameter(torch.cat([ids, ids.clone()], dim=0), requires_grad=ids.requires_grad)
 
             param_dicts.append(
                 {
@@ -619,15 +630,12 @@ class SplatADModel(ADModel):
                     "id": ids,
                 }
             )
-        return torch.nn.ParameterDict(
-            {
-                key: torch.cat(
-                    [param_dict[key] for param_dict in param_dicts],
-                    dim=0,
-                )
-                for key in param_dicts[0].keys()
-            }
-        )
+        combined_params = {}
+        for key in param_dicts[0].keys():
+            first_param = param_dicts[0][key]
+            concatenated = torch.cat([param_dict[key] for param_dict in param_dicts], dim=0)
+            combined_params[key] = torch.nn.Parameter(concatenated, requires_grad=first_param.requires_grad)
+        return torch.nn.ParameterDict(combined_params)
 
     @torch.no_grad()
     def split_seed_points(self, seed_points: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Dict, ForwardRef, Generic, List, Literal, Optional, Tuple, Type, Union, cast, get_args, get_origin
 
 import torch
-from gsplat import map_points_to_lidar_tiles, points_mapping_offset_encode, populate_image_from_points
+from gsplat.cuda._wrapper import map_points_to_lidar_tiles, points_mapping_offset_encode, populate_image_from_points
 from rich.progress import track
 from typing_extensions import assert_never
 
