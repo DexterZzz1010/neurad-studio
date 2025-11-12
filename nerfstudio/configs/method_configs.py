@@ -409,7 +409,7 @@ method_configs["splatgut"] = TrainerConfig(
             cache_images_type="uint8",
         ),
         model=SplatGUTModelConfig(
-            max_steps=30001,
+            max_steps=40001,
             with_ut=True,
             with_eval3d=True,
             camera_model="pinhole",
