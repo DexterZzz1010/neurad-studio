@@ -57,7 +57,7 @@ class SplatGUTModelConfig(SplatADModelConfig):
     # max_num_seed_points: int = 100_000_000
     # mcmc_cap_max: int = 200_000_000
 
-    background_color: Literal["random", "black", "white"] = "black"
+    background_color: Literal["random", "black", "white"] = "white"
     """Whether to randomize the background color."""
 
 class SplatGUTModel(SplatADModel):
