@@ -411,7 +411,11 @@ method_configs["colmap-splatad"] = TrainerConfig(
             dataparser=ColmapDataParserConfig(
                 sequence="colmap",
                 train_split_fraction=0.9,
-                scene_box_height=(-10, 30),
+                colmap_model_path="colmap",
+                images_path="colmap/images_rectified",
+                use_binary_model=False,
+                ignore_missing_images=True,
+                synthetic_time_interval=0.01,
             ),
             cache_images_type="uint8",
         ),
@@ -513,10 +517,15 @@ method_configs["colmap-splatgut"].pipeline.datamanager = FullImageLidarDatamanag
     dataparser=ColmapDataParserConfig(
         sequence="colmap",
         train_split_fraction=0.9,
-        scene_box_height=(-10, 30),
+        colmap_model_path="colmap",
+        images_path="colmap/images_rectified",
+        use_binary_model=False,
+        ignore_missing_images=True,
+        synthetic_time_interval=0.01,
     ),
     cache_images_type="uint8",
 )
+method_configs["colmap-splatgut"].pipeline.model.camera_model = "fisheye"
 
 method_configs["neurad"] = TrainerConfig(
     method_name="neurad",
