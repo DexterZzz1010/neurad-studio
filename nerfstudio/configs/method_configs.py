@@ -32,6 +32,7 @@ from nerfstudio.data.datamanagers.ad_datamanager import ADDataManagerConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
 from nerfstudio.data.datamanagers.full_images_lidar_datamanager import FullImageLidarDatamanagerConfig
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManagerConfig
+from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
 from nerfstudio.data.dataparsers.pandaset_dataparser import PandaSetDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig, AdamWOptimizerConfig, RAdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
@@ -56,6 +57,8 @@ descriptions = {
     "neurad-paper": "NeuRAD with settings matching the paper.",
     "splatad": "Gaussian Splatting model for autonomous driving",
     "splatgut": "SplatAD + 3DGUT for distortion-aware Gaussian Splatting",
+    "colmap-splatad": "SplatAD pipeline that reads COLMAP reconstructions",
+    "colmap-splatgut": "SplatGUT pipeline configured for COLMAP datasets",
 }
 
 method_configs["nerfacto"] = TrainerConfig(
@@ -394,6 +397,31 @@ method_configs["splatad"] = TrainerConfig(
     vis="viewer",
 )
 
+method_configs["colmap-splatad"] = TrainerConfig(
+    method_name="colmap-splatad",
+    steps_per_eval_image=500,
+    steps_per_eval_batch=0,
+    steps_per_save=2000,
+    steps_per_eval_all_images=2500,
+    max_num_iterations=30001,
+    mixed_precision=False,
+    pipeline=SplatADPipelineConfig(
+        calc_fid_steps=(30000,),
+        datamanager=FullImageLidarDatamanagerConfig(
+            dataparser=ColmapDataParserConfig(
+                sequence="colmap",
+                train_split_fraction=0.9,
+                scene_box_height=(-10, 30),
+            ),
+            cache_images_type="uint8",
+        ),
+        model=SplatADModelConfig(max_steps=30001),
+    ),
+    optimizers=deepcopy(method_configs["splatad"].optimizers),
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    vis="viewer",
+)
+
 method_configs["splatgut"] = TrainerConfig(
     method_name="splatgut",
     steps_per_eval_image=500,
@@ -477,6 +505,17 @@ method_configs["splatgut"] = TrainerConfig(
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
+)
+
+method_configs["colmap-splatgut"] = deepcopy(method_configs["splatgut"])
+method_configs["colmap-splatgut"].method_name = "colmap-splatgut"
+method_configs["colmap-splatgut"].pipeline.datamanager = FullImageLidarDatamanagerConfig(
+    dataparser=ColmapDataParserConfig(
+        sequence="colmap",
+        train_split_fraction=0.9,
+        scene_box_height=(-10, 30),
+    ),
+    cache_images_type="uint8",
 )
 
 method_configs["neurad"] = TrainerConfig(
