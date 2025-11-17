@@ -257,7 +257,28 @@ class PandaSet(ADDataParser):
 
         @lru_cache(maxsize=1)
         def read_point_cloud(filepath):
-            return pd.read_pickle(filepath).values
+            try:
+                return pd.read_pickle(filepath).values
+            except TypeError:
+                # 兼容旧版 pandas 生成的 pickle（pandas>=2.1 会在 BlockManager 反序列化时报错）
+                import pickle
+                try:
+                    from pandas.compat import pickle_compat  # type: ignore
+                except Exception:
+                    pickle_compat = None
+
+                with open(filepath, "rb") as f:
+                    if pickle_compat is not None:
+                        obj = pickle_compat.load(f, encoding="latin1")
+                    else:
+                        obj = pickle.load(f)
+
+                # 部分旧 pickle 会返回 dict/list，而不是 DataFrame
+                if hasattr(obj, "values"):
+                    return obj.values
+                if isinstance(obj, np.ndarray):
+                    return obj
+                return np.asarray(obj)
 
         for i, filename in enumerate(filepaths):
             lidar = lidars[i]
