@@ -349,8 +349,13 @@ class PandaSet(ADDataParser):
         for i in range(PANDASET_SEQ_LEN):
             curr_cuboids = self.sequence.cuboids[i]
             # Remove invalid cuboids
+            stationary_flags = np.array(curr_cuboids["stationary"], dtype=np.bool8)  # True for static objects
+            if self.config.include_stationary_actors:
+                dynamic_mask = np.ones_like(stationary_flags, dtype=np.bool8)
+            else:
+                dynamic_mask = ~stationary_flags
             is_allowed_class = np.array([label in allowed_classes for label in curr_cuboids["label"]])
-            valid_mask = (~curr_cuboids["stationary"]) & is_allowed_class
+            valid_mask = dynamic_mask & is_allowed_class
             curr_cuboids = curr_cuboids[valid_mask]
             if not len(curr_cuboids):
                 continue
@@ -361,7 +366,7 @@ class PandaSet(ADDataParser):
             yaw = curr_cuboids["yaw"].astype(np.float32)
             rot = _yaw_to_rotation_matrix(yaw)
 
-            stationary = np.array(curr_cuboids["stationary"], dtype=np.bool8)  # True for static objects
+            stationary = stationary_flags[valid_mask]
             pos_x = curr_cuboids["position.x"].astype(np.float32)  # x position of cuboid in world coords
             pos_y = curr_cuboids["position.y"].astype(np.float32)  # y position of cuboid in world coords
             pos_z = curr_cuboids["position.z"].astype(np.float32)  # z position of cuboid in world coords

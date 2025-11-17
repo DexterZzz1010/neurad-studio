@@ -524,8 +524,8 @@ class Argoverse2(ADDataParser):
             # check if the actor is stationary, if it has moved more than 0.5m in any direction
             dynamic = np.any(np.std(actor_world_poses[:, :3, 3], axis=0) > 0.5)
 
-            # remove all static objects
-            if not dynamic:
+            # remove all static objects unless explicitly requested
+            if not dynamic and not self.config.include_stationary_actors:
                 continue
 
             trajs.append(

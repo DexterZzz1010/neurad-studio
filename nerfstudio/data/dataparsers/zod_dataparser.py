@@ -420,8 +420,8 @@ class Zod(ADDataParser):
             poses = np.array(poses)
             # dynamic if we move more that 1m in any direction
             dynamic = np.any(np.std(poses[:, :3, 3], axis=0) > 1.0)
-            # we skip all stationary objects
-            if not dynamic:
+            # we skip all stationary objects unless explicitly requested
+            if not dynamic and not self.config.include_stationary_actors:
                 continue
 
             symmetric = label in SYMMETRIC_CATEGORIES

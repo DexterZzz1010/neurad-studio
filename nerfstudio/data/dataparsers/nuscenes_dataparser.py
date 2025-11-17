@@ -396,7 +396,9 @@ class NuScenes(ADDataParser):
             dims = dims.max(0).values  # take max dimensions (important for deformable objects)
             dynamic = (poses[:, :2, 3].std(dim=0) > 0.50).any()
             stationary = not dynamic  # TODO: maybe make this stricter
-            if stationary or not _is_label_allowed(traj_list[0]["label"], allowed_classes):
+            if (stationary and not self.config.include_stationary_actors) or not _is_label_allowed(
+                traj_list[0]["label"], allowed_classes
+            ):
                 continue
             traj_dict = {
                 "uuid": instance_token,

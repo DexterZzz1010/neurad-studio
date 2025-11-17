@@ -224,6 +224,16 @@ Further, as we build on top of nerfstudio, models such as ```nerfacto``` or ```s
 
 For a full list of included models run `python nerfstudio/scripts/train.py --help`.
 
+### Static actor editing
+
+要在渲染阶段同时操作静态与动态目标，请在训练时保留静态标注：
+
+- 训练命令追加 `--pipeline.dataparser.include_stationary_actors True`（Hydra 变量名区分大小写），例如  
+  `sbatch --partition=zprod scripts/train_pandaset.sh --pipeline.dataparser.include_stationary_actors True`
+- 该标记会写入运行目录中的 `config.yml`，随后的 `render.py`、`scripts/render.sh` 或 `scripts/aug_render.sh` 会对所有 actor 使用同一套平移 / 旋转参数。
+
+若旧模型未启用此开关，需要重新训练才能编辑静态目标。
+
 ### Modify Configuration
 
 Each model contains many parameters that can be changed, too many to list here. Use the `--help` command to see the full list of configuration options.

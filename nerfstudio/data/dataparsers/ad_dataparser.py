@@ -86,6 +86,8 @@ class ADDataParserConfig(DataParserConfig):
     """Whether to load cuboid annotations."""
     include_deformable_actors: bool = False
     """Whether to include deformable actors in the loaded trajectories (like pedestrians)."""
+    include_stationary_actors: bool = False
+    """Whether to keep stationary actors in the loaded trajectories."""
     annotation_interval: float = 0.0
     """The time interval at which the sequence is annotated (s)."""
     trajectory_extrapolation_length: float = 1.0
