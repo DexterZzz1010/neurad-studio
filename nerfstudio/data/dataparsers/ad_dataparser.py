@@ -226,7 +226,7 @@ class ADDataParser(DataParser):
             image_filenames=img_filenames,
             cameras=cameras,
             scene_box=scene_box,
-            mask_filenames=None,  # TODO: handle masks
+            mask_filenames=getattr(self, "_mask_filenames", None),
             dataparser_scale=1.0,  # no scaling
             dataparser_transform=dataparser_transform,
             actor_transform=self.actor_transform,

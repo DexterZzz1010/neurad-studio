@@ -120,6 +120,8 @@ class ColmapDataParserConfig(ADDataParserConfig):
     """Optional path (relative to dataset root) that maps image paths to timestamps."""
     camera_timestamp_reference_sensor: Optional[str] = None
     """Sensor prefix (e.g. 'FISHF') used as the reference timeline for alignment."""
+    masks_path: Optional[str] = None
+    """Optional path to per-image masks (mirrors images_path layout)."""
     lidar_frames_path: Optional[str] = None
     """Directory that stores raw LiDAR frames (frame_XXXXX.pcd)."""
     lidar_timestamps_path: Optional[str] = None
@@ -541,6 +543,9 @@ class ColmapDataParser(ADDataParser):
         image_timestamp_table = self._load_image_timestamp_table(dataset_root)
         frame_sensor_names: List[str] = []
         raw_timestamps: List[Optional[float]] = []
+        mask_root = self._resolve_optional_path(dataset_root, self.config.masks_path) if self.config.masks_path else None
+        mask_filenames: List[Path] = []
+        mask_missing = False
 
         for image in cam_extrinsics:
             if camera_id_filter and image.camera_id not in camera_id_filter:
@@ -593,6 +598,11 @@ class ColmapDataParser(ADDataParser):
             if raw_time is None:
                 raw_time = image_timestamp_table.get(rel_name.name)
             raw_timestamps.append(raw_time)
+            if mask_root is not None:
+                mask_path = self._resolve_mask_file(dataset_root, mask_root, rel_name)
+                if mask_path is None or not mask_path.is_file():
+                    mask_missing = True
+                mask_filenames.append(mask_path if mask_path is not None else Path())
 
         if not poses:
             raise RuntimeError("No COLMAP frames were loaded. Check filters and paths.")
@@ -618,6 +628,19 @@ class ColmapDataParser(ADDataParser):
                 "timestamps": times,
             },
         )
+        if mask_root is not None and len(mask_filenames) == len(image_filenames):
+            exists_count = len([m for m in mask_filenames if m and m.is_file()])
+            if not mask_missing and exists_count == len(image_filenames):
+                self._mask_filenames = mask_filenames
+                CONSOLE.log(f"[green]Loaded {len(mask_filenames)} masks from {mask_root}")
+            else:
+                self._mask_filenames = None
+                CONSOLE.log(
+                    f"[yellow]Masks requested at {mask_root} but not all were found "
+                    f"(matched {exists_count}/{len(image_filenames)}); continuing without masks."
+                )
+        else:
+            self._mask_filenames = None
         return cameras, image_filenames
 
     def _get_lidars(self) -> Tuple[Lidars, List[Path]]:
@@ -682,6 +705,35 @@ class ColmapDataParser(ADDataParser):
                 return candidate
         # Fall back to relative to images root if nothing matched yet
         return images_root / rel_name
+
+    def _resolve_mask_file(self, dataset_root: Path, masks_root: Path, rel_name: Path) -> Optional[Path]:
+        """Resolve a mask filename mirroring the image path layout, trying common extensions."""
+        if rel_name.is_absolute():
+            rel_name = rel_name.relative_to(rel_name.anchor)
+        ext_candidates = [rel_name]
+        # common variants: same name, force png/jpg, or append .png to existing suffix (handles *.jpg.png)
+        ext_candidates.append(rel_name.with_suffix(".png"))
+        ext_candidates.append(rel_name.with_suffix(".jpg"))
+        if rel_name.suffix:
+            ext_candidates.append(rel_name.with_suffix(rel_name.suffix + ".png"))
+        candidates: List[Path] = []
+        for name in ext_candidates:
+            candidates.extend(
+                [
+                    dataset_root / name,
+                    masks_root / name,
+                    name,
+                ]
+            )
+        seen = set()
+        for candidate in candidates:
+            key = candidate.resolve().as_posix() if candidate.exists() else candidate.as_posix()
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
 
     def _load_point_cloud(self, dataset_root: Path, model_root: Path) -> Tensor:
         if getattr(self, "_cached_point_cloud_tensor", None) is not None:

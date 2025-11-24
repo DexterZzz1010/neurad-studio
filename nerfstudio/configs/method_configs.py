@@ -520,13 +520,14 @@ method_configs["colmap-splatgut"].pipeline.datamanager = FullImageLidarDatamanag
         train_split_fraction=0.9,
         colmap_model_path="colmap",
         images_path="colmap/images_rectified",
+        masks_path="colmap/masks_rectified",
         use_binary_model=False,
         ignore_missing_images=True,
         synthetic_time_interval=0.01,
         camera_timestamps_path="colmap/file_mapping.json",
-        camera_timestamp_reference_sensor="FISHF",
+        camera_timestamp_reference_sensor="FC",
         reference_pose_file="colmap/images_ref_rs.txt",
-        reference_sensor_name="FISHF",
+        reference_sensor_name="FC",
         lidar_frames_path="../o3d_frames",
         lidar_timestamps_path="../o3d_frames/timestamps.npy",
         lidar_quaternion=(
@@ -546,7 +547,7 @@ method_configs["colmap-splatgut"].optimizers = {
         "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
         "scheduler": ExponentialDecaySchedulerConfig(
             lr_final=1.6e-6,
-            max_steps=30000,
+            max_steps=40000,
         ),
     },
     "features_dc": {
@@ -554,15 +555,15 @@ method_configs["colmap-splatgut"].optimizers = {
         "scheduler": None,
     },
     "features_rest": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
         "scheduler": None,
     },
     "opacities": {
-        "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
         "scheduler": None,
     },
     "scales": {
-        "optimizer": AdamOptimizerConfig(lr=0.002, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
         "scheduler": None,
     },
     "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},

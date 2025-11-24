@@ -430,7 +430,12 @@ class SplatADPipeline(VanillaPipeline):
 
         if actor_fids:
             for edit_type in actor_edits.keys():
-                metrics_dict[f"actor_shift_{edit_type}_fid"] = actor_fids[edit_type].compute().item()
+                fid = actor_fids[edit_type]
+                real_n = getattr(fid, "real_features_num_samples", 0)
+                fake_n = getattr(fid, "fake_features_num_samples", 0)
+                if real_n < 2 or fake_n < 2:
+                    continue
+                metrics_dict[f"actor_shift_{edit_type}_fid"] = fid.compute().item()
 
         self.train()
         return metrics_dict
