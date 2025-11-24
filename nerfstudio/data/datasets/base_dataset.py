@@ -131,10 +131,18 @@ class InputDataset(Dataset):
         data = {"image_idx": image_idx, "image": image}
         if self._dataparser_outputs.mask_filenames is not None:
             mask_filepath = self._dataparser_outputs.mask_filenames[image_idx]
-            data["mask"] = get_image_mask_tensor_from_path(filepath=mask_filepath, scale_factor=self.scale_factor)
-            assert (
-                data["mask"].shape[:2] == data["image"].shape[:2]
-            ), f"Mask and image have different shapes. Got {data['mask'].shape[:2]} and {data['image'].shape[:2]}"
+            if mask_filepath and mask_filepath.is_file():
+                data["mask"] = get_image_mask_tensor_from_path(filepath=mask_filepath, scale_factor=self.scale_factor)
+                if data["mask"].shape[:2] != data["image"].shape[:2]:
+                    from nerfstudio.utils.rich_utils import CONSOLE
+                    CONSOLE.log(
+                        f"[yellow]Skipping mask due to size mismatch: mask {data['mask'].shape[:2]} vs "
+                        f"image {data['image'].shape[:2]} at {mask_filepath}"
+                    )
+                    data.pop("mask", None)
+            else:
+                from nerfstudio.utils.rich_utils import CONSOLE
+                CONSOLE.log(f"[yellow]Mask file missing or invalid: {mask_filepath}; skipping mask.")
         if self.mask_color:
             data["image"] = torch.where(
                 data["mask"] == 1.0, data["image"], torch.ones_like(data["image"]) * torch.tensor(self.mask_color)

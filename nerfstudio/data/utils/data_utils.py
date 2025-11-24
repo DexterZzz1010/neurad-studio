@@ -30,14 +30,26 @@ def get_image_mask_tensor_from_path(filepath: Path, scale_factor: float = 1.0) -
     Utility function to read a mask image from the given path and return a boolean tensor
     """
     pil_mask = Image.open(filepath)
+    # Log shape/mode for debugging multi-channel masks.
+    try:
+        from nerfstudio.utils.rich_utils import CONSOLE
+        CONSOLE.log(f"[yellow]Mask load: path={filepath}, mode={pil_mask.mode}, size={pil_mask.size}")
+    except Exception:
+        pass
     if scale_factor != 1.0:
         width, height = pil_mask.size
         newsize = (int(width * scale_factor), int(height * scale_factor))
         pil_mask = pil_mask.resize(newsize, resample=Image.Resampling.NEAREST)
-    mask_tensor = torch.from_numpy(np.array(pil_mask)).unsqueeze(-1).bool()
-    if len(mask_tensor.shape) != 3:
-        raise ValueError("The mask image should have 1 channel")
-    return mask_tensor
+    arr = np.array(pil_mask)
+    if arr.ndim == 2:
+        mask_tensor = torch.from_numpy(arr).unsqueeze(-1)
+    elif arr.ndim == 3:
+        # If RGBA, prefer alpha channel; otherwise take the first channel
+        channel_idx = 3 if arr.shape[2] == 4 else 0
+        mask_tensor = torch.from_numpy(arr[..., channel_idx:channel_idx + 1])
+    else:
+        raise ValueError(f"The mask image should have 1 channel, got shape {arr.shape} for {filepath}")
+    return mask_tensor.bool()
 
 
 def get_semantics_and_mask_tensors_from_path(
