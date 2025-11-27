@@ -403,7 +403,7 @@ method_configs["colmap-splatad"] = TrainerConfig(
     steps_per_eval_image=500,
     steps_per_eval_batch=0,
     steps_per_save=2000,
-    steps_per_eval_all_images=2500,
+    steps_per_eval_all_images=50000,
     max_num_iterations=30001,
     mixed_precision=False,
     pipeline=SplatADPipelineConfig(
@@ -429,10 +429,10 @@ method_configs["colmap-splatad"] = TrainerConfig(
 
 method_configs["splatgut"] = TrainerConfig(
     method_name="splatgut",
-    steps_per_eval_image=500,
+    steps_per_eval_image=50000,
     steps_per_eval_batch=0,
     steps_per_save=2000,
-    steps_per_eval_all_images=2500,
+    steps_per_eval_all_images=250000,
     max_num_iterations=30001,
     mixed_precision=False,
     pipeline=SplatADPipelineConfig(
@@ -447,7 +447,7 @@ method_configs["splatgut"] = TrainerConfig(
             with_eval3d=True,
             camera_model="pinhole",
             strategy="mcmc",
-            mcmc_cap_max=7_500_000,
+            mcmc_cap_max=2_000_000,
             mcmc_noise_lr=2e4,
             mcmc_min_opacity=0.005,
         ),
@@ -551,11 +551,11 @@ method_configs["colmap-splatgut"].optimizers = {
         ),
     },
     "features_dc": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025/40, eps=1e-15),
         "scheduler": None,
     },
     "features_rest": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025/40, eps=1e-15),
         "scheduler": None,
     },
     "opacities": {
