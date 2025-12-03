@@ -530,13 +530,12 @@ method_configs["colmap-splatgut"].pipeline.datamanager = FullImageLidarDatamanag
         reference_sensor_name="FC",
         lidar_frames_path="../o3d_frames",
         lidar_timestamps_path="../o3d_frames/timestamps.npy",
-        lidar_quaternion=(
-            0.6960765295335133,
-            -0.00244159368565038,
-            0.0001385997267153349,
-            -0.7179634283464374,
-        ),
-        lidar_translation=(1.116397595777498, 0.002015994268530099, 1.74425940541538),
+        # Vehicle-frame extrinsics; l2c will be computed as inv(T_c2v) @ T_l2v
+        vehicle_lidar_quaternion=(0.6960765295335133, -0.00244159368565038, 0.0001385997267153349, -0.7179634283464374),
+        vehicle_lidar_translation=(1.116397595777498, 0.002015994268530099, 1.74425940541538),
+
+        vehicle_camera_quaternion=(-0.4895178353134785, 0.5106169040063513, -0.4907313715598111, 0.5087488449323524),
+        vehicle_camera_translation=(2.009330573500526, -0.008145578463557433, 1.151854914801598),
     ),
     cache_images_type="uint8",
 )
