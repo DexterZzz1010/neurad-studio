@@ -226,7 +226,7 @@ class ADDataParser(DataParser):
             image_filenames=img_filenames,
             cameras=cameras,
             scene_box=scene_box,
-            mask_filenames=None,  # TODO: handle masks
+            mask_filenames=getattr(self, "_mask_filenames", None),
             dataparser_scale=1.0,  # no scaling
             dataparser_transform=dataparser_transform,
             actor_transform=self.actor_transform,
@@ -363,6 +363,8 @@ class ADDataParser(DataParser):
         cameras.metadata["angular_velocities_local"] = torch.zeros_like(cameras.camera_to_worlds[:, :3, 3])
         for sensor_idx in cameras.metadata["sensor_idxs"].unique():
             mask = (cameras.metadata["sensor_idxs"] == sensor_idx).squeeze(-1)
+            if mask.sum() <= 1:
+                continue
             cam2worlds, times = cameras.camera_to_worlds[mask], cameras.times[mask]
             translation_velo = (cam2worlds[1:, :3, 3] - cam2worlds[:-1, :3, 3]) / (times[1:] - times[:-1])
             next_cam = cam2worlds[1:]
@@ -390,6 +392,8 @@ class ADDataParser(DataParser):
         lidars.metadata["angular_velocities_local"] = torch.zeros_like(lidars.lidar_to_worlds[:, :3, 3])
         for sensor_idx in lidars.metadata["sensor_idxs"].unique():
             mask = (lidars.metadata["sensor_idxs"] == sensor_idx).squeeze(-1)
+            if mask.sum() <= 1:
+                continue
             lidar2worlds, times = lidars.lidar_to_worlds[mask], lidars.times[mask]
             translation_velo = (lidar2worlds[1:, :3, 3] - lidar2worlds[:-1, :3, 3]) / (times[1:] - times[:-1])
             next_lidar = lidar2worlds[1:]

@@ -15,10 +15,12 @@
 
 from __future__ import annotations
 
+import bisect
+import json
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type, Literal
 
 import numpy as np
 import torch
@@ -39,6 +41,9 @@ from threedgrut.datasets.utils import (
     read_colmap_extrinsics_text,
     read_colmap_intrinsics_binary,
     read_colmap_intrinsics_text,
+    read_colmap_points3D_binary,
+    read_colmap_points3D_text,
+    sample_points3d_data,
     qvec_to_so3,
 )
 
@@ -70,7 +75,7 @@ class ColmapDataParserConfig(ADDataParserConfig):
     _target: Type = field(default_factory=lambda: ColmapDataParser)
 
     cameras: Tuple[str, ...] = ("colmap",)
-    lidars: Tuple[str, ...] = tuple()
+    lidars: Tuple[str, ...] = ("colmap_points",)
     load_cuboids: bool = False
     annotation_interval: float = 1.0
 
@@ -96,6 +101,41 @@ class ColmapDataParserConfig(ADDataParserConfig):
     """Optional mapping from COLMAP camera ID to a human readable sensor name."""
     scene_box_padding: float = 10.0
     """Meters of padding to add around camera centers when deriving the scene bounding box."""
+    points3d_path: Optional[str] = None
+    """Optional override for the COLMAP points3D file (relative to dataset root)."""
+    use_binary_points: Optional[bool] = None
+    """When None, follow use_binary_model. Otherwise force binary/text point loading."""
+    max_point_cloud_points: int = 2_000_000
+    """Maximum number of points kept from the COLMAP cloud."""
+    pointcloud_downsample_method: Literal["random", "farthest"] = "random"
+    """Strategy used when downsizing the COLMAP point cloud."""
+    min_point_cloud_points: int = 1000
+    """Generate fallback seeds if fewer valid points remain after sanitization."""
+    fallback_pointcloud_size: int = 50000
+    """Number of fallback seeds to synthesize when COLMAP data is invalid."""
+    fallback_pointcloud_padding: float = 5.0
+    """Padding added to the camera bounding box when sampling fallback seeds."""
+
+    camera_timestamps_path: Optional[str] = None
+    """Optional path (relative to dataset root) that maps image paths to timestamps."""
+    camera_timestamp_reference_sensor: Optional[str] = None
+    """Sensor prefix (e.g. 'FISHF') used as the reference timeline for alignment."""
+    masks_path: Optional[str] = None
+    """Optional path to per-image masks (mirrors images_path layout)."""
+    lidar_frames_path: Optional[str] = None
+    """Directory that stores raw LiDAR frames (frame_XXXXX.pcd)."""
+    lidar_timestamps_path: Optional[str] = None
+    """NumPy array storing timestamps for each LiDAR frame."""
+    lidar_to_camera_transform_path: Optional[str] = None
+    """Optional 4x4 matrix describing the LiDAR-to-reference-camera transform."""
+    reference_pose_file: Optional[str] = None
+    """Optional path to images_ref_rs.txt that lists reference->camera poses."""
+    reference_sensor_name: Optional[str] = None
+    """Sensor name in the reference pose file that corresponds to the desired camera (e.g. FISHF)."""
+    lidar_quaternion: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    """LiDAR quaternion given as (w, x, y, z) in the reference coordinate frame."""
+    lidar_translation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """LiDAR translation (meters) in the reference coordinate frame."""
 
 
 @dataclass
@@ -104,9 +144,366 @@ class ColmapDataParser(ADDataParser):
 
     config: ColmapDataParserConfig
 
+    _time_key_precision: float = 1e-6
+
+    def _resolve_optional_path(self, dataset_root: Path, path_str: Optional[str]) -> Optional[Path]:
+        if not path_str:
+            return None
+        path = _resolve_dataset_path(dataset_root, path_str)
+        return path if path.exists() else None
+
+    def _matrix_from_quaternion_and_translation(
+        self, quaternion: Tuple[float, float, float, float], translation: Tuple[float, float, float]
+    ) -> torch.Tensor:
+        if len(quaternion) != 4:
+            raise ValueError("Quaternion must contain 4 elements (qw, qx, qy, qz).")
+        if len(translation) != 3:
+            raise ValueError("Translation must contain 3 elements.")
+        rot = qvec_to_so3(np.asarray(quaternion, dtype=np.float64))
+        mat = torch.eye(4, dtype=torch.float32)
+        mat[:3, :3] = torch.from_numpy(rot.astype(np.float32))
+        mat[:3, 3] = torch.tensor(translation, dtype=torch.float32)
+        return mat
+
+    def _parse_reference_pose_text_file(self, path: Path) -> Dict[str, torch.Tensor]:
+        transforms: Dict[str, torch.Tensor] = {}
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                lines = [line.strip() for line in file if line.strip()]
+        except OSError as exc:
+            raise RuntimeError(f"Failed to read reference pose file: {path}") from exc
+        if not lines:
+            return transforms
+        cursor = 0
+        try:
+            sensor_count = int(lines[cursor].split()[0])
+            cursor += 1
+        except (ValueError, IndexError):
+            sensor_count = 0
+        for _ in range(sensor_count):
+            if cursor >= len(lines):
+                break
+            tokens = lines[cursor].split()
+            cursor += 1
+            if len(tokens) < 10:
+                continue
+            name = tokens[-1]
+            try:
+                quaternion = tuple(float(value) for value in tokens[1:5])
+                translation = tuple(float(value) for value in tokens[5:8])
+            except ValueError:
+                continue
+            transforms[name] = self._matrix_from_quaternion_and_translation(quaternion, translation)
+        return transforms
+
+    def _parse_reference_pose_json(self, path: Path) -> Dict[str, torch.Tensor]:
+        transforms: Dict[str, torch.Tensor] = {}
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Failed to parse reference pose json: {path}") from exc
+        if not isinstance(payload, list):
+            return transforms
+        for rig in payload:
+            cameras = rig.get("cameras", [])
+            for camera in cameras:
+                name = camera.get("image_prefix") or camera.get("name")
+                if not name:
+                    continue
+                name = name.rstrip("/")
+                qvec = camera.get("rel_qvec") or camera.get("qvec")
+                tvec = camera.get("rel_tvec") or camera.get("tvec")
+                if qvec is None or tvec is None or len(qvec) != 4 or len(tvec) != 3:
+                    continue
+                transforms[name] = self._matrix_from_quaternion_and_translation(
+                    tuple(float(v) for v in qvec), tuple(float(v) for v in tvec)
+                )
+        return transforms
+
+    def _load_reference_sensor_transform(self, dataset_root: Path) -> Optional[torch.Tensor]:
+        path = self._resolve_optional_path(dataset_root, self.config.reference_pose_file)
+        sensor_name = self.config.reference_sensor_name
+        if path is None or not sensor_name:
+            return None
+        if path.suffix.lower() == ".json":
+            transforms = self._parse_reference_pose_json(path)
+        else:
+            transforms = self._parse_reference_pose_text_file(path)
+        sensor_key = sensor_name.rstrip("/")
+        return transforms.get(sensor_key)
+
+    def _load_image_timestamp_table(self, dataset_root: Path) -> Dict[str, float]:
+        table: Dict[str, float] = {}
+        path = self._resolve_optional_path(dataset_root, self.config.camera_timestamps_path)
+        if path is None:
+            return table
+        try:
+            if path.suffix.lower() == ".json":
+                with open(path, "r", encoding="utf-8") as file:
+                    payload = json.load(file)
+                if isinstance(payload, dict):
+                    iterable = payload.values()
+                else:
+                    iterable = payload
+                for entry in iterable:
+                    rel_path = entry.get("path") or entry.get("image") or entry.get("name")
+                    timestamp = entry.get("timestamp")
+                    if rel_path is None or timestamp is None:
+                        continue
+                    normalized = self._normalize_timestamp_value(timestamp)
+                    if normalized is None:
+                        continue
+                    table[str(rel_path)] = normalized
+                    table[Path(rel_path).name] = normalized
+            else:
+                with open(path, "r", encoding="utf-8") as file:
+                    for line in file:
+                        parts = line.strip().split()
+                        if len(parts) < 3:
+                            continue
+                        _, ts, key = parts[0], parts[1], parts[2]
+                        normalized = self._normalize_timestamp_value(ts)
+                        if normalized is None:
+                            continue
+                        table[key] = normalized
+        except Exception as exc:  # pylint: disable=broad-except
+            CONSOLE.log(f"[yellow]Failed to parse camera timestamps from {path}: {exc}")
+        return table
+
+    def _normalize_timestamp_value(self, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        magnitude = abs(numeric)
+        if magnitude > 1e15:
+            return numeric * 1e-9  # assume nanoseconds
+        if magnitude > 1e12:
+            return numeric * 1e-6  # assume microseconds
+        if magnitude > 1e9:
+            return numeric  # already seconds
+        if magnitude > 1e6:
+            return numeric * 1e-3
+        return numeric
+
+    def _finalize_camera_times(
+        self,
+        raw_timestamps: List[Optional[float]],
+        sensor_names: List[str],
+        poses: torch.Tensor,
+    ) -> torch.Tensor:
+        valid = [ts for ts in raw_timestamps if ts is not None]
+        origin = min(valid) if valid else 0.0
+        self._time_origin = origin
+
+        ref_sensor = self.config.camera_timestamp_reference_sensor or (sensor_names[0] if sensor_names else None)
+        reference_entries: List[Tuple[float, torch.Tensor]] = []
+        relative_times: List[float] = []
+
+        for idx, (timestamp, sensor_name) in enumerate(zip(raw_timestamps, sensor_names)):
+            value = timestamp
+            if value is None:
+                value = origin + idx * float(self.config.synthetic_time_interval)
+            relative = float(value) - origin
+            relative_times.append(relative)
+            if ref_sensor and sensor_name == ref_sensor:
+                reference_entries.append((relative, poses[idx, :3, :4].detach().cpu()))
+
+        if ref_sensor and not reference_entries and sensor_names:
+            fallback_sensor = sensor_names[0]
+            for idx, sensor_name in enumerate(sensor_names):
+                if sensor_name == fallback_sensor:
+                    reference_entries.append((relative_times[idx], poses[idx, :3, :4].detach().cpu()))
+            ref_sensor = fallback_sensor
+        reference_entries.sort(key=lambda item: item[0])
+        self._reference_sensor_name = ref_sensor
+        self._reference_pose_times_array = (
+            np.array([item[0] for item in reference_entries], dtype=np.float64) if reference_entries else np.array([])
+        )
+        self._reference_pose_mats = [item[1] for item in reference_entries]
+        self._reference_pose_lookup = {
+            self._time_key(time): pose for time, pose in reference_entries
+        }
+
+        return torch.tensor(relative_times, dtype=torch.float64).unsqueeze(-1)
+
+    def _time_key(self, value: float) -> int:
+        precision = getattr(self, "_time_key_precision", 1e-6)
+        return int(round(value / precision))
+
+    def _lookup_reference_pose(self, aligned_time: float) -> Optional[torch.Tensor]:
+        lookup = getattr(self, "_reference_pose_lookup", None)
+        if lookup:
+            pose = lookup.get(self._time_key(aligned_time))
+            if pose is not None:
+                return pose
+        ref_times = getattr(self, "_reference_pose_times_array", None)
+        ref_poses = getattr(self, "_reference_pose_mats", None)
+        if ref_times is None or ref_poses is None or len(ref_poses) == 0:
+            return None
+        idx = bisect.bisect_left(ref_times, aligned_time)
+        candidates: List[Tuple[float, torch.Tensor]] = []
+        if idx < len(ref_poses):
+            candidates.append((abs(ref_times[idx] - aligned_time), ref_poses[idx]))
+        if idx > 0:
+            candidates.append((abs(ref_times[idx - 1] - aligned_time), ref_poses[idx - 1]))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _load_lidar_to_camera_transform(self, dataset_root: Path) -> torch.Tensor:
+        path = self._resolve_optional_path(dataset_root, self.config.lidar_to_camera_transform_path)
+        if path is None:
+            reference_transform = self._load_reference_sensor_transform(dataset_root)
+            if reference_transform is not None:
+                try:
+                    lidar_to_reference = self._matrix_from_quaternion_and_translation(
+                        self.config.lidar_quaternion, self.config.lidar_translation
+                    )
+                except ValueError as exc:
+                    raise RuntimeError("Invalid LiDAR quaternion or translation configuration.") from exc
+                return torch.matmul(reference_transform, lidar_to_reference)
+            return torch.eye(4, dtype=torch.float32)
+        try:
+            if path.suffix.lower() == ".npy":
+                matrix = np.load(path)
+            else:
+                with open(path, "r", encoding="utf-8") as file:
+                    matrix = json.load(file)
+            matrix = np.asarray(matrix, dtype=np.float32)
+            if matrix.shape != (4, 4):
+                raise ValueError(f"Expected a 4x4 matrix, received shape {matrix.shape}")
+            return torch.from_numpy(matrix)
+        except Exception as exc:  # pylint: disable=broad-except
+            raise RuntimeError(f"Failed to read LiDAR extrinsic from {path}") from exc
+
+    def _load_lidar_timestamps(self, dataset_root: Path) -> List[Optional[float]]:
+        path = self._resolve_optional_path(dataset_root, self.config.lidar_timestamps_path)
+        if path is None:
+            return []
+        try:
+            raw = np.load(path)
+        except Exception as exc:  # pylint: disable=broad-except
+            raise RuntimeError(f"Failed to read LiDAR timestamps from {path}") from exc
+        flat = np.asarray(raw).reshape(-1)
+        return [self._normalize_timestamp_value(float(value)) for value in flat]
+
+    def _align_lidar_times(self, raw_times: List[Optional[float]]) -> List[float]:
+        origin = getattr(self, "_time_origin", 0.0)
+        aligned: List[float] = []
+        for idx, raw_time in enumerate(raw_times):
+            value = raw_time
+            if value is None:
+                value = origin + idx * float(self.config.synthetic_time_interval)
+            aligned.append(float(value) - origin)
+        return aligned
+
+    def _parse_pcd_xyz(self, path: Path) -> np.ndarray:
+        with open(path, "rb") as file:
+            header: Dict[str, str] = {}
+            while True:
+                line = file.readline()
+                if not line:
+                    raise ValueError(f"Malformed PCD file: {path}")
+                text = line.decode("utf-8").strip()
+                if not text or text.startswith("#"):
+                    continue
+                key, *rest = text.split(" ", 1)
+                if key.upper() == "DATA":
+                    data_type = rest[0].strip().lower() if rest else ""
+                    break
+                header[key.lower()] = rest[0].strip() if rest else ""
+            if data_type != "binary":
+                raise ValueError(f"Unsupported PCD DATA type '{data_type}' in {path}")
+            fields = header.get("fields", "").split()
+            sizes = [int(val) for val in header.get("size", "").split()]
+            types = header.get("type", "").split()
+            counts = [int(val) for val in header.get("count", "").split()]
+            points = int(header.get("points", header.get("width", "0")))
+            if not fields or len(fields) != len(sizes):
+                raise ValueError(f"Invalid PCD header in {path}")
+            if points <= 0:
+                raise ValueError(f"PCD file '{path}' has no points.")
+            if any(c != 1 for c in counts):
+                raise ValueError(f"Multi-count PCD fields are not supported (file: {path}).")
+            if any(t.upper() != "F" or s != 4 for t, s in zip(types, sizes)):
+                raise ValueError(f"Only 32-bit float PCD files are supported (file: {path}).")
+            raw = np.fromfile(file, dtype=np.float32, count=points * len(fields))
+            if raw.size != points * len(fields):
+                raise ValueError(f"Unexpected data size while reading {path}")
+            raw = raw.reshape(points, len(fields))
+            field_to_index = {name: idx for idx, name in enumerate(fields)}
+            try:
+                xyz = np.stack(
+                    [raw[:, field_to_index["x"]], raw[:, field_to_index["y"]], raw[:, field_to_index["z"]]],
+                    axis=1,
+                )
+            except KeyError as exc:
+                raise KeyError(f"Missing required XYZ fields in {path}") from exc
+        return xyz
+
+    def _load_dynamic_lidars(self, dataset_root: Path) -> Tuple[Lidars, List[Path]]:
+        frames_dir = self._resolve_optional_path(dataset_root, self.config.lidar_frames_path)
+        if frames_dir is None:
+            raise FileNotFoundError("LiDAR frames directory is not configured or does not exist.")
+        frame_paths = sorted(p for p in Path(frames_dir).glob("*.pcd") if p.is_file())
+        if not frame_paths:
+            raise FileNotFoundError(f"No .pcd files found under {frames_dir}")
+        raw_times = self._load_lidar_timestamps(dataset_root)
+        if not raw_times:
+            raise FileNotFoundError("LiDAR timestamps are required when loading dynamic LiDAR scans.")
+        if len(raw_times) != len(frame_paths):
+            CONSOLE.log(
+                f"[yellow]LiDAR timestamps ({len(raw_times)}) do not match frame count ({len(frame_paths)}); truncating."
+            )
+            count = min(len(raw_times), len(frame_paths))
+            raw_times = raw_times[:count]
+            frame_paths = frame_paths[:count]
+        aligned_times = self._align_lidar_times(raw_times)
+        lidar_to_camera = getattr(self, "_lidar_to_camera_pose", None)
+        if lidar_to_camera is None:
+            lidar_to_camera = self._load_lidar_to_camera_transform(dataset_root)
+            self._lidar_to_camera_pose = lidar_to_camera
+        lidar_to_worlds: List[torch.Tensor] = []
+        for time_value in aligned_times:
+            pose = self._lookup_reference_pose(time_value)
+            if pose is None:
+                if lidar_to_worlds:
+                    pose = lidar_to_worlds[-1]
+                else:
+                    pose = torch.eye(3, 4)
+            l2w = torch.eye(4)
+            l2w[:3, :4] = pose if pose.shape == (3, 4) else pose[:3, :4]
+            l2w = torch.matmul(l2w, lidar_to_camera)
+            lidar_to_worlds.append(l2w[:3, :4].clone())
+        lidar_to_world_tensor = torch.stack([mat.float() for mat in lidar_to_worlds], dim=0)
+        times_tensor = torch.tensor(aligned_times, dtype=torch.float64).unsqueeze(-1)
+        zero_velocity = torch.zeros((len(aligned_times), 3), dtype=torch.float32)
+        metadata = {
+            "sensor_idxs": torch.zeros((len(aligned_times), 1), dtype=torch.int32),
+            "linear_velocities_local": zero_velocity,
+            "angular_velocities_local": zero_velocity,
+            "timestamps": times_tensor,
+        }
+        lidars = Lidars(lidar_to_worlds=lidar_to_world_tensor, times=times_tensor, metadata=metadata)
+        self._dynamic_lidar = True
+        return lidars, frame_paths
+
+    def _load_pcd_tensor(self, path: Path) -> torch.Tensor:
+        xyz = self._parse_pcd_xyz(path).astype(np.float32)
+        intensity = np.ones((xyz.shape[0], 1), dtype=np.float32)
+        relative_times = np.zeros((xyz.shape[0], 1), dtype=np.float32)
+        data = np.concatenate([xyz, intensity, relative_times], axis=1)
+        return torch.from_numpy(data)
+
     def _get_cameras(self) -> Tuple[Cameras, List[Path]]:
         dataset_root = Path(self.config.data).expanduser()
         model_root = _resolve_dataset_path(dataset_root, self.config.colmap_model_path)
+        self._dataset_root = dataset_root
+        self._model_root = model_root
         images_root = _resolve_dataset_path(dataset_root, self.config.images_path)
         intrinsics_path = model_root / ("cameras.bin" if self.config.use_binary_model else "cameras.txt")
         extrinsics_path = model_root / ("images.bin" if self.config.use_binary_model else "images.txt")
@@ -142,6 +539,13 @@ class ColmapDataParser(ADDataParser):
                 camera_id_to_sensor_idx[camera_id] = sensor_idx
                 sensor_names.append(self.config.camera_id_to_name.get(camera_id, f"camera_{camera_id}"))
             return camera_id_to_sensor_idx[camera_id]
+
+        image_timestamp_table = self._load_image_timestamp_table(dataset_root)
+        frame_sensor_names: List[str] = []
+        raw_timestamps: List[Optional[float]] = []
+        mask_root = self._resolve_optional_path(dataset_root, self.config.masks_path) if self.config.masks_path else None
+        mask_filenames: List[Path] = []
+        missing_masks = False
 
         for image in cam_extrinsics:
             if camera_id_filter and image.camera_id not in camera_id_filter:
@@ -180,21 +584,36 @@ class ColmapDataParser(ADDataParser):
             widths.append(width)
             heights.append(height)
             camera_types.append(CAMERA_MODEL_TO_TYPE.get(intrinsic.model, CameraType.PERSPECTIVE).value)
-            poses.append(torch.from_numpy(pose[:3, :4]).float())
+            pose_tensor = torch.from_numpy(pose[:3, :4]).float()
+            poses.append(pose_tensor)
             image_filenames.append(img_path)
             camera_ids.append(image.camera_id)
-            sensor_idxs.append(_sensor_idx(image.camera_id))
+            sensor_idx = _sensor_idx(image.camera_id)
+            sensor_idxs.append(sensor_idx)
+            rel_name = Path(image.name)
+            sensor_prefix = rel_name.parts[0] if len(rel_name.parts) > 1 else rel_name.stem.split("_")[0]
+            frame_sensor_names.append(sensor_prefix)
+            timestamp_key = rel_name.as_posix()
+            raw_time = image_timestamp_table.get(timestamp_key)
+            if raw_time is None:
+                raw_time = image_timestamp_table.get(rel_name.name)
+            raw_timestamps.append(raw_time)
+            if mask_root is not None:
+                mask_path = self._resolve_mask_file(dataset_root, mask_root, rel_name)
+                if mask_path is None or not mask_path.exists():
+                    missing_masks = True
+                mask_filenames.append(mask_path if mask_path is not None else Path())
 
         if not poses:
             raise RuntimeError("No COLMAP frames were loaded. Check filters and paths.")
 
         self.config.cameras = tuple(sensor_names)
 
-        times = torch.arange(len(poses), dtype=torch.float64).unsqueeze(-1)
-        times *= float(self.config.synthetic_time_interval)
-
+        camera_to_world_tensor = torch.stack(poses, dim=0)
+        times = self._finalize_camera_times(raw_timestamps, frame_sensor_names, camera_to_world_tensor)
+        self._camera_positions_world = camera_to_world_tensor[:, :3, 3].cpu().numpy()
         cameras = Cameras(
-            camera_to_worlds=torch.stack(poses, dim=0),
+            camera_to_worlds=camera_to_world_tensor,
             fx=torch.tensor(fx_list, dtype=torch.float32),
             fy=torch.tensor(fy_list, dtype=torch.float32),
             cx=torch.tensor(cx_list, dtype=torch.float32),
@@ -206,20 +625,45 @@ class ColmapDataParser(ADDataParser):
             metadata={
                 "sensor_idxs": torch.tensor(sensor_idxs, dtype=torch.int32).unsqueeze(-1),
                 "camera_ids": torch.tensor(camera_ids, dtype=torch.int32).unsqueeze(-1),
+                "timestamps": times,
             },
         )
+        if mask_root is not None and not missing_masks and len(mask_filenames) == len(image_filenames):
+            self._mask_filenames = mask_filenames
+            CONSOLE.log(f"[green]Loaded {len(mask_filenames)} masks from {mask_root}")
+        else:
+            self._mask_filenames = None
+            if mask_root is not None:
+                CONSOLE.log(
+                    f"[yellow]Masks requested at {mask_root} but not all were found "
+                    f"(matched {len([m for m in mask_filenames if m and m.exists()])}/{len(image_filenames)}); "
+                    "continuing without masks."
+                )
         return cameras, image_filenames
 
     def _get_lidars(self) -> Tuple[Lidars, List[Path]]:
+        dataset_root = getattr(self, "_dataset_root", Path(self.config.data).expanduser())
+        model_root = getattr(self, "_model_root", _resolve_dataset_path(dataset_root, self.config.colmap_model_path))
+        if self.config.lidar_frames_path and self.config.lidar_timestamps_path:
+            return self._load_dynamic_lidars(dataset_root)
+        self._dynamic_lidar = False
+        point_cloud = self._load_point_cloud(dataset_root, model_root)
+        lidar_to_world = torch.eye(4, dtype=torch.float32)[:3].unsqueeze(0)
         lidars = Lidars(
-            lidar_to_worlds=torch.zeros((0, 3, 4), dtype=torch.float32),
-            times=torch.zeros((0, 1), dtype=torch.float64),
-            metadata={"sensor_idxs": torch.zeros((0, 1), dtype=torch.int32)},
+            lidar_to_worlds=lidar_to_world,
+            times=torch.zeros((1, 1), dtype=torch.float64),
+            metadata={"sensor_idxs": torch.zeros((1, 1), dtype=torch.int32)},
         )
-        return lidars, []
+        source_path = getattr(self, "_point_cloud_source_path", model_root / "points3D.txt")
+        return lidars, [source_path]
 
     def _read_lidars(self, lidars: Lidars, filenames: List[Path]) -> List[Tensor]:
-        return []
+        if getattr(self, "_dynamic_lidar", False):
+            return [self._load_pcd_tensor(path) for path in filenames]
+        dataset_root = getattr(self, "_dataset_root", Path(self.config.data).expanduser())
+        model_root = getattr(self, "_model_root", _resolve_dataset_path(dataset_root, self.config.colmap_model_path))
+        point_cloud = self._load_point_cloud(dataset_root, model_root)
+        return [point_cloud]
 
     def _get_actor_trajectories(self):
         return []
@@ -259,6 +703,144 @@ class ColmapDataParser(ADDataParser):
                 return candidate
         # Fall back to relative to images root if nothing matched yet
         return images_root / rel_name
+
+    def _resolve_mask_file(self, dataset_root: Path, masks_root: Path, rel_name: Path) -> Optional[Path]:
+        """Resolve a mask filename mirroring the image path layout."""
+        if rel_name.is_absolute():
+            rel_name = rel_name.relative_to(rel_name.anchor)
+        candidates = [
+            dataset_root / rel_name,
+            masks_root / rel_name,
+            rel_name,
+        ]
+        seen = set()
+        for candidate in candidates:
+            key = candidate.resolve().as_posix() if candidate.exists() else candidate.as_posix()
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _load_point_cloud(self, dataset_root: Path, model_root: Path) -> Tensor:
+        if getattr(self, "_cached_point_cloud_tensor", None) is not None:
+            return self._cached_point_cloud_tensor
+        points_path = self._resolve_point_cloud_path(dataset_root, model_root)
+        self._point_cloud_source_path = points_path
+        positions, colors, errors = self._read_point_cloud_arrays(points_path)
+        positions, colors, errors = self._sanitize_point_cloud_arrays(positions, colors, errors)
+        positions, colors, errors = self._maybe_downsample_points(positions, colors, errors)
+        used_fallback = False
+        if positions.shape[0] < self.config.min_point_cloud_points:
+            positions, colors, errors = self._generate_fallback_point_cloud(points_path)
+            used_fallback = True
+        intensities = (colors.mean(axis=1, keepdims=True) / 255.0).astype(np.float32)
+        times = np.zeros((positions.shape[0], 1), dtype=np.float32)
+        point_cloud = np.concatenate([positions.astype(np.float32), intensities, times], axis=1)
+        tensor = torch.from_numpy(point_cloud)
+        finite_mask = torch.isfinite(tensor).all(dim=1)
+        tensor = tensor[finite_mask]
+        if tensor.numel() == 0:
+            positions, colors, errors = self._generate_fallback_point_cloud(points_path)
+            used_fallback = True
+            intensities = (colors.mean(axis=1, keepdims=True) / 255.0).astype(np.float32)
+            times = np.zeros((positions.shape[0], 1), dtype=np.float32)
+            tensor = torch.from_numpy(np.concatenate([positions.astype(np.float32), intensities, times], axis=1))
+        CONSOLE.log(
+            f"[green]Seed cloud ready: {tensor.shape[0]} points "
+            f"({'fallback' if used_fallback else 'COLMAP'}) from '{points_path.name}'"
+        )
+        self._cached_point_cloud_tensor = tensor
+        return tensor
+
+    def _resolve_point_cloud_path(self, dataset_root: Path, model_root: Path) -> Path:
+        if self.config.points3d_path:
+            candidate = _resolve_dataset_path(dataset_root, self.config.points3d_path)
+            if not candidate.exists():
+                raise FileNotFoundError(f"Configured points3D path does not exist: {candidate}")
+            return candidate
+        prefer_binary = (
+            self.config.use_binary_points
+            if self.config.use_binary_points is not None
+            else self.config.use_binary_model
+        )
+        candidates: List[Path] = []
+        if prefer_binary:
+            candidates.extend(
+                [
+                    model_root / "points3D.bin",
+                    model_root / "points3D.txt",
+                    # model_root / "points3D_10M.txt",
+                ]
+            )
+        else:
+            candidates.extend(
+                [
+                    model_root / "points3D.txt",
+                    # model_root / "points3D_10M.txt",
+                    model_root / "points3D.bin",
+                ]
+            )
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(f"Missing COLMAP points3D file under {model_root}")
+
+    def _read_point_cloud_arrays(self, path: Path):
+        suffix = path.suffix.lower()
+        if suffix == ".bin":
+            positions, colors, errors = read_colmap_points3D_binary(str(path))
+        elif suffix == ".txt":
+            positions, colors, errors = read_colmap_points3D_text(str(path))
+        else:
+            raise ValueError(f"Unsupported COLMAP point cloud format: {path}")
+        return positions, colors, errors
+
+    def _maybe_downsample_points(self, positions: np.ndarray, colors: np.ndarray, errors: np.ndarray):
+        max_points = self.config.max_point_cloud_points
+        if max_points is None or max_points <= 0 or len(positions) <= max_points:
+            return self._sanitize_point_cloud_arrays(positions, colors, errors)
+        method = self.config.pointcloud_downsample_method.lower()
+        if method == "farthest":
+            positions, colors, errors = sample_points3d_data(positions, colors, errors, max_points)
+            return self._sanitize_point_cloud_arrays(positions, colors, errors)
+        if method == "random":
+            indices = np.random.choice(len(positions), max_points, replace=False)
+            return self._sanitize_point_cloud_arrays(positions[indices], colors[indices], errors[indices])
+        raise ValueError(f"Unknown pointcloud_downsample_method: {self.config.pointcloud_downsample_method}")
+
+    def _sanitize_point_cloud_arrays(
+        self, positions: np.ndarray, colors: np.ndarray, errors: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        mask = np.isfinite(positions).all(axis=1)
+        mask &= np.isfinite(colors).all(axis=1)
+        if errors is not None and errors.size:
+            mask &= np.isfinite(errors).all(axis=1)
+        positions = positions[mask]
+        colors = colors[mask]
+        errors = errors[mask]
+        return positions, colors, errors
+
+    def _generate_fallback_point_cloud(self, source_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        CONSOLE.print(
+            f"[yellow]COLMAP point cloud '{source_path}' is empty or invalid. "
+            f"Generating {self.config.fallback_pointcloud_size} synthetic seeds."
+        )
+        num_points = max(self.config.fallback_pointcloud_size, self.config.min_point_cloud_points)
+        if hasattr(self, "_camera_positions_world") and len(self._camera_positions_world):
+            mins = self._camera_positions_world.min(axis=0)
+            maxs = self._camera_positions_world.max(axis=0)
+        else:
+            mins = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
+            maxs = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        padding = float(self.config.fallback_pointcloud_padding)
+        mins = (mins - padding).astype(np.float32)
+        maxs = (maxs + padding).astype(np.float32)
+        positions = np.random.uniform(mins, maxs, size=(num_points, 3)).astype(np.float32)
+        colors = (np.random.rand(num_points, 3) * 255.0).astype(np.float32)
+        errors = np.zeros((num_points, 1), dtype=np.float32)
+        return positions, colors, errors
 
     def _compute_scene_box(self, cameras: Cameras, lidars: Lidars) -> SceneBox:
         if len(lidars):

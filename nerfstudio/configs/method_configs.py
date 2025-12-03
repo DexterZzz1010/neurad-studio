@@ -59,6 +59,7 @@ descriptions = {
     "splatgut": "SplatAD + 3DGUT for distortion-aware Gaussian Splatting",
     "colmap-splatad": "SplatAD pipeline that reads COLMAP reconstructions",
     "colmap-splatgut": "SplatGUT pipeline configured for COLMAP datasets",
+    "pandaset-splatgut": "SplatGUT pipeline tuned for PandaSet driving data",
 }
 
 method_configs["nerfacto"] = TrainerConfig(
@@ -519,13 +520,84 @@ method_configs["colmap-splatgut"].pipeline.datamanager = FullImageLidarDatamanag
         train_split_fraction=0.9,
         colmap_model_path="colmap",
         images_path="colmap/images_rectified",
+        masks_path="colmap/masks_rectified",
         use_binary_model=False,
         ignore_missing_images=True,
         synthetic_time_interval=0.01,
+        camera_timestamps_path="colmap/file_mapping.json",
+        camera_timestamp_reference_sensor="FC",
+        reference_pose_file="colmap/images_ref_rs.txt",
+        reference_sensor_name="FC",
+        lidar_frames_path="../o3d_frames",
+        lidar_timestamps_path="../o3d_frames/timestamps.npy",
+        lidar_quaternion=(
+            0.6960765295335133,
+            -0.00244159368565038,
+            0.0001385997267153349,
+            -0.7179634283464374,
+        ),
+        lidar_translation=(1.116397595777498, 0.002015994268530099, 1.74425940541538),
     ),
     cache_images_type="uint8",
 )
 method_configs["colmap-splatgut"].pipeline.model.camera_model = "fisheye"
+# Optimizers (explicit copy of splatgut defaults for clarity)
+method_configs["colmap-splatgut"].optimizers = {
+    "means": {
+        "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=1.6e-6,
+            max_steps=40000,
+        ),
+    },
+    "features_dc": {
+        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+        "scheduler": None,
+    },
+    "features_rest": {
+        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+        "scheduler": None,
+    },
+    "opacities": {
+        "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+        "scheduler": None,
+    },
+    "scales": {
+        "optimizer": AdamOptimizerConfig(lr=0.002, eps=1e-15),
+        "scheduler": None,
+    },
+    "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
+    "camera_opt": {
+        "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-7, max_steps=30000),
+    },
+    "camera_velocity_opt_linear": {
+        "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+        ),
+    },
+    "camera_velocity_opt_angular": {
+        "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=1e-7, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+        ),
+    },
+    "camera_velocity_opt_time_to_center_pixel": {
+        "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(
+            lr_final=1e-7, max_steps=30000, warmup_steps=10000, lr_pre_warmup=0
+        ),
+    },
+    "trajectory_opt": {
+        "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+        "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=20001, warmup_steps=2500),
+    },
+    "fields": {
+        "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15, weight_decay=1e-6),
+        "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-3, max_steps=20001, warmup_steps=500),
+    },
+}
 
 method_configs["neurad"] = TrainerConfig(
     method_name="neurad",

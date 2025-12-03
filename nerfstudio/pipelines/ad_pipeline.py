@@ -132,11 +132,12 @@ class ADPipeline(VanillaPipeline):
         metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
 
         # Lidar eval
-        lidar, batch = self.datamanager.next_eval_lidar(step)
-        outputs, batch = self.model.get_outputs_for_lidar(lidar, batch=batch)
-        lidar_metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
-        assert not set(lidar_metrics_dict.keys()).intersection(metrics_dict.keys())
-        metrics_dict.update(lidar_metrics_dict)
+        if getattr(self.datamanager, "has_eval_lidar", True):
+            lidar, batch = self.datamanager.next_eval_lidar(step)
+            outputs, batch = self.model.get_outputs_for_lidar(lidar, batch=batch)
+            lidar_metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
+            assert not set(lidar_metrics_dict.keys()).intersection(metrics_dict.keys())
+            metrics_dict.update(lidar_metrics_dict)
 
         self.train()
         return metrics_dict, images_dict
@@ -291,19 +292,20 @@ class ADPipeline(VanillaPipeline):
                     )
                 progress.advance(task)
             num_lidar = len(self.datamanager.fixed_indices_eval_lidar_dataloader)
-            task = progress.add_task("[green]Evaluating all eval point clouds...", total=num_lidar)
-            for lidar, batch in self.datamanager.fixed_indices_eval_lidar_dataloader:
-                torch.cuda.synchronize()
-                inner_start = time()
-                outputs, batch = self.model.get_outputs_for_lidar(lidar, batch=batch)
-                torch.cuda.synchronize()
-                inference_time_lidar = time() - inner_start
-                metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
-                num_lidar_rays = batch["lidar"].shape[0]
-                assert "num_lidar_rays_per_sec" not in metrics_dict
-                metrics_dict["num_lidar_rays_per_sec"] = num_lidar_rays / inference_time_lidar
-                metrics_dict_list.append(metrics_dict)
-                progress.advance(task)
+            if num_lidar > 0:
+                task = progress.add_task("[green]Evaluating all eval point clouds...", total=num_lidar)
+                for lidar, batch in self.datamanager.fixed_indices_eval_lidar_dataloader:
+                    torch.cuda.synchronize()
+                    inner_start = time()
+                    outputs, batch = self.model.get_outputs_for_lidar(lidar, batch=batch)
+                    torch.cuda.synchronize()
+                    inference_time_lidar = time() - inner_start
+                    metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
+                    num_lidar_rays = batch["lidar"].shape[0]
+                    assert "num_lidar_rays_per_sec" not in metrics_dict
+                    metrics_dict["num_lidar_rays_per_sec"] = num_lidar_rays / inference_time_lidar
+                    metrics_dict_list.append(metrics_dict)
+                    progress.advance(task)
 
         # average the metrics list
         metrics_dict = {}

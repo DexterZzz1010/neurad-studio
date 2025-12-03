@@ -194,12 +194,13 @@ class SplatADPipeline(VanillaPipeline):
         assert "num_rays" not in metrics_dict
         metrics_dict["num_rays"] = (camera.height * camera.width * camera.size).item()
 
-        lidar, batch = self.datamanager.next_eval_lidar(step)
-        outputs = self.model.get_lidar_outputs(lidar)
-        lidar_metrics_dict, lidar_images_dict = self.model.get_image_metrics_and_images(outputs, batch)
-        images_dict.update(lidar_images_dict)
-        assert not set(lidar_metrics_dict.keys()).intersection(metrics_dict.keys())
-        metrics_dict.update(lidar_metrics_dict)
+        if getattr(self.datamanager, "has_eval_lidar", True):
+            lidar, batch = self.datamanager.next_eval_lidar(step)
+            outputs = self.model.get_lidar_outputs(lidar)
+            lidar_metrics_dict, lidar_images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+            images_dict.update(lidar_images_dict)
+            assert not set(lidar_metrics_dict.keys()).intersection(metrics_dict.keys())
+            metrics_dict.update(lidar_metrics_dict)
 
         self.train()
         return metrics_dict, images_dict
@@ -336,47 +337,48 @@ class SplatADPipeline(VanillaPipeline):
                     )
                 progress.advance(task)
 
-            task = progress.add_task("[green]Evaluating all eval point clouds...", total=num_lidar)
-            for lidar, batch in self.datamanager.fixed_indices_eval_lidar_dataloader:
-                torch.cuda.synchronize()
-                inner_start = time()
-                outputs = self.model.get_lidar_outputs(lidar)
-                torch.cuda.synchronize()
-                inference_time_lidar = time() - inner_start
-                metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
-                num_lidar_rays = (batch["raster_pts"][..., 2] > 0).sum()
-                assert "num_lidar_rays_per_sec" not in metrics_dict
-                metrics_dict["num_lidar_rays_per_sec"] = (num_lidar_rays / inference_time_lidar).item()
-                metrics_dict_list.append(metrics_dict)
-                if dump_img_to_disk:
-                    assert output_path is not None
-                    os.makedirs(output_path / "fid" / "lidar", exist_ok=True)
-                    gt_points = batch["lidar"][batch["lidar_pts_did_return"]]  # N, 5 (xyz, intensity, time_offset)
-                    # if filter_lidar_pred_and_gt is a function of the model, call it here
-                    if hasattr(self.model, "filter_lidar_pred_and_gt"):
-                        lidar_pred, lidar_gt = self.model.filter_lidar_pred_and_gt(
-                            outputs, batch, output_point_cloud=True
-                        )
-                        pred_points = lidar_pred["point_cloud"]  # M, 3
-                        pred_points_median = lidar_pred["median_point_cloud"]
-                        pred_points_mask = (lidar_pred["ray_drop"].sigmoid() <= 0.5) * lidar_gt["valid"]
-                        intensity = outputs["intensity"].flatten()[pred_points_mask]
-                        time_offset = batch["raster_pts"][..., 3].flatten()[pred_points_mask]
-                        pred_points = torch.cat(
-                            [pred_points, intensity[..., None], time_offset[..., None]], dim=-1
-                        )  # M, 5 (xyz, intensity, time_offset)
-                        pred_points_median = torch.cat(
-                            [pred_points_median, intensity[..., None], time_offset[..., None]], dim=-1
-                        )  # M, 5 (xyz, intensity, time_offset)
+            if num_lidar > 0:
+                task = progress.add_task("[green]Evaluating all eval point clouds...", total=num_lidar)
+                for lidar, batch in self.datamanager.fixed_indices_eval_lidar_dataloader:
+                    torch.cuda.synchronize()
+                    inner_start = time()
+                    outputs = self.model.get_lidar_outputs(lidar)
+                    torch.cuda.synchronize()
+                    inference_time_lidar = time() - inner_start
+                    metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
+                    num_lidar_rays = (batch["raster_pts"][..., 2] > 0).sum()
+                    assert "num_lidar_rays_per_sec" not in metrics_dict
+                    metrics_dict["num_lidar_rays_per_sec"] = (num_lidar_rays / inference_time_lidar).item()
+                    metrics_dict_list.append(metrics_dict)
+                    if dump_img_to_disk:
+                        assert output_path is not None
+                        os.makedirs(output_path / "fid" / "lidar", exist_ok=True)
+                        gt_points = batch["lidar"][batch["lidar_pts_did_return"]]  # N, 5 (xyz, intensity, time_offset)
+                        # if filter_lidar_pred_and_gt is a function of the model, call it here
+                        if hasattr(self.model, "filter_lidar_pred_and_gt"):
+                            lidar_pred, lidar_gt = self.model.filter_lidar_pred_and_gt(
+                                outputs, batch, output_point_cloud=True
+                            )
+                            pred_points = lidar_pred["point_cloud"]  # M, 3
+                            pred_points_median = lidar_pred["median_point_cloud"]
+                            pred_points_mask = (lidar_pred["ray_drop"].sigmoid() <= 0.5) * lidar_gt["valid"]
+                            intensity = outputs["intensity"].flatten()[pred_points_mask]
+                            time_offset = batch["raster_pts"][..., 3].flatten()[pred_points_mask]
+                            pred_points = torch.cat(
+                                [pred_points, intensity[..., None], time_offset[..., None]], dim=-1
+                            )  # M, 5 (xyz, intensity, time_offset)
+                            pred_points_median = torch.cat(
+                                [pred_points_median, intensity[..., None], time_offset[..., None]], dim=-1
+                            )  # M, 5 (xyz, intensity, time_offset)
 
-                        # save the pred_points and gt_points to a file
-                        np.savez(
-                            output_path / "fid" / "lidar" / f"points_{str(lidar.metadata['cam_idx']).zfill(6)}.npz",
-                            pred_points=pred_points.cpu().numpy(),
-                            pred_points_median=pred_points_median.cpu().numpy(),
-                            gt_points=gt_points.cpu().numpy(),
-                        )
-                progress.advance(task)
+                            # save the pred_points and gt_points to a file
+                            np.savez(
+                                output_path / "fid" / "lidar" / f"points_{str(lidar.metadata['cam_idx']).zfill(6)}.npz",
+                                pred_points=pred_points.cpu().numpy(),
+                                pred_points_median=pred_points_median.cpu().numpy(),
+                                gt_points=gt_points.cpu().numpy(),
+                            )
+                    progress.advance(task)
 
         # average the metrics list
         metrics_dict = {}
@@ -428,7 +430,12 @@ class SplatADPipeline(VanillaPipeline):
 
         if actor_fids:
             for edit_type in actor_edits.keys():
-                metrics_dict[f"actor_shift_{edit_type}_fid"] = actor_fids[edit_type].compute().item()
+                fid = actor_fids[edit_type]
+                real_n = getattr(fid, "real_features_num_samples", 0)
+                fake_n = getattr(fid, "fake_features_num_samples", 0)
+                if real_n < 2 or fake_n < 2:
+                    continue
+                metrics_dict[f"actor_shift_{edit_type}_fid"] = fid.compute().item()
 
         self.train()
         return metrics_dict
@@ -535,6 +542,11 @@ class SplatADPipeline(VanillaPipeline):
         output_path,
     ) -> None:
         """Updates the FID metrics (for shifted actor views) for the given ray bundle and images."""
+        # Skip actor FID when no dynamic actors are present.
+        dyn_actors = getattr(self.model, "dynamic_actors", None)
+        boxes = getattr(dyn_actors, "boxes_to_world", None) if dyn_actors is not None else None
+        if dyn_actors is None or boxes is None or boxes.ndim < 4 or boxes.shape[1] == 0:
+            return
         # Update "true" FID (with hack to only compute it once)
         img_original = (
             (self._downsample_img((orig_img).permute(2, 0, 1)) * 255).unsqueeze(0).to(torch.uint8).to(self.device)
