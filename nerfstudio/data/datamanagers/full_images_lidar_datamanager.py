@@ -62,8 +62,8 @@ ELEV_CHANNELS_PER_TILE = 8
 class FullImageLidarDatamanagerConfig(FullImageDatamanagerConfig):
     _target: Type = field(default_factory=lambda: FullImageLidarDatamanager)
     dataparser: AnnotatedDataParserUnion = field(default_factory=DataParserConfig)
-    evaluate_lidar: bool = True
-    """Whether to evaluate LiDAR scans during validation."""
+    # evaluate_lidar: bool = True
+    # """Whether to evaluate LiDAR scans during validation."""
     eval_num_lidars_to_sample_from: int = -1
     """Number of lidars to sample during eval iteration."""
     eval_num_times_to_repeat_lidars: int = -1
@@ -125,8 +125,7 @@ class FullImageLidarDatamanager(FullImageDatamanager, Generic[TDataset]):
 
         # Some logic to make sure we sample every camera in equal amounts
         self.train_unseen_lidars = [i for i in range(len(self.train_lidar_dataset))]
-        self.has_eval_lidar = self.config.evaluate_lidar and len(self.eval_lidar_dataset) > 0
-        self.eval_unseen_lidars = [i for i in range(len(self.eval_lidar_dataset))] if self.has_eval_lidar else []
+        self.eval_unseen_lidars = [i for i in range(len(self.eval_lidar_dataset))]
         assert len(self.train_unseen_lidars) > 0, "No data found in dataset"
 
     @cached_property
@@ -139,8 +138,6 @@ class FullImageLidarDatamanager(FullImageDatamanager, Generic[TDataset]):
     def cached_lidar_eval(self) -> List[Dict[str, torch.Tensor]]:
         """Get the eval images. Will load and undistort the images the
         first time this (cached) property is accessed."""
-        if not self.has_eval_lidar:
-            return []
         return self._load_lidars("eval", cache_lidars_device=self.config.cache_lidars)
 
     def _lidar_to_raster_pts(
@@ -391,7 +388,7 @@ class FullImageLidarDatamanager(FullImageDatamanager, Generic[TDataset]):
         """
         Pretends to be the dataloader for evaluation, it returns a list of (lidar, data) tuples
         """
-        if not self.has_eval_lidar:
+        if len(self.eval_lidar_dataset) == 0:
             return []
         lidar_indices = [i for i in range(len(self.eval_lidar_dataset))]
         data = [d.copy() for d in self.cached_lidar_eval]
@@ -501,8 +498,6 @@ class FullImageLidarDatamanager(FullImageDatamanager, Generic[TDataset]):
         """Returns the next evaluation batch
 
         Returns a Lidar instead of raybundle"""
-        if not self.has_eval_lidar:
-            raise RuntimeError("LiDAR evaluation was disabled via evaluate_lidar=False.")
         if len(self.eval_unseen_lidars) == 0:
             self.eval_unseen_lidars = [i for i in range(len(self.eval_lidar_dataset))]
         lidar_idx = self.eval_unseen_lidars.pop(random.randint(0, len(self.eval_unseen_lidars) - 1))
