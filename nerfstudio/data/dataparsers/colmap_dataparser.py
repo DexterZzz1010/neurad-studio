@@ -95,7 +95,7 @@ class ColmapDataParserConfig(ADDataParserConfig):
     """Scale factor applied to COLMAP intrinsics if images were downscaled after reconstruction."""
     synthetic_time_interval: float = 1.0
     """Spacing between consecutive timestamps when COLMAP does not provide real capture times."""
-    apply_opencv_to_nerfstudio: bool = True
+    apply_opencv_to_nerfstudio: bool = False
     """Whether to flip COLMAP's (right-down-forward) axes into NeuRAD's (right-forward-up)."""
     camera_id_to_name: Dict[int, str] = field(default_factory=dict)
     """Optional mapping from COLMAP camera ID to a human readable sensor name."""
@@ -136,6 +136,11 @@ class ColmapDataParserConfig(ADDataParserConfig):
     """LiDAR quaternion given as (w, x, y, z) in the reference coordinate frame."""
     lidar_translation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     """LiDAR translation (meters) in the reference coordinate frame."""
+    vehicle_lidar_quaternion: Optional[Tuple[float, float, float, float]] = None
+    """LiDAR quaternion (wxyz) in vehicle coordinate frame; if set with vehicle_camera_quaternion/translation, l2c is computed as inv(T_c2v) @ T_l2v."""
+    vehicle_lidar_translation: Optional[Tuple[float, float, float]] = None
+    vehicle_camera_quaternion: Optional[Tuple[float, float, float, float]] = None
+    vehicle_camera_translation: Optional[Tuple[float, float, float]] = None
 
 
 @dataclass
@@ -302,6 +307,7 @@ class ColmapDataParser(ADDataParser):
         ref_sensor = self.config.camera_timestamp_reference_sensor or (sensor_names[0] if sensor_names else None)
         reference_entries: List[Tuple[float, torch.Tensor]] = []
         relative_times: List[float] = []
+        absolute_times: List[float] = []
 
         for idx, (timestamp, sensor_name) in enumerate(zip(raw_timestamps, sensor_names)):
             value = timestamp
@@ -309,6 +315,7 @@ class ColmapDataParser(ADDataParser):
                 value = origin + idx * float(self.config.synthetic_time_interval)
             relative = float(value) - origin
             relative_times.append(relative)
+            absolute_times.append(float(value))
             if ref_sensor and sensor_name == ref_sensor:
                 reference_entries.append((relative, poses[idx, :3, :4].detach().cpu()))
 
@@ -327,6 +334,9 @@ class ColmapDataParser(ADDataParser):
         self._reference_pose_lookup = {
             self._time_key(time): pose for time, pose in reference_entries
         }
+
+        self._camera_relative_times = relative_times
+        self._camera_absolute_times = absolute_times
 
         return torch.tensor(relative_times, dtype=torch.float64).unsqueeze(-1)
 
@@ -355,6 +365,26 @@ class ColmapDataParser(ADDataParser):
         return min(candidates, key=lambda item: item[0])[1]
 
     def _load_lidar_to_camera_transform(self, dataset_root: Path) -> torch.Tensor:
+        # Prefer computing l2c from vehicle-frame extrinsics if provided
+        if (
+            self.config.vehicle_lidar_quaternion
+            and self.config.vehicle_lidar_translation
+            and self.config.vehicle_camera_quaternion
+            and self.config.vehicle_camera_translation
+        ):
+            try:
+                t_l2v = self._matrix_from_quaternion_and_translation(
+                    self.config.vehicle_lidar_quaternion, self.config.vehicle_lidar_translation
+                )
+                t_c2v = self._matrix_from_quaternion_and_translation(
+                    self.config.vehicle_camera_quaternion, self.config.vehicle_camera_translation
+                )
+                l2c = torch.linalg.inv(t_c2v) @ t_l2v
+                # l2c =  t_c2v @ torch.linalg.inv(t_l2v) 
+                return l2c
+            except Exception as exc:  # pylint: disable=broad-except
+                raise RuntimeError("Failed to compute LiDAR->Camera from vehicle-frame extrinsics") from exc
+
         path = self._resolve_optional_path(dataset_root, self.config.lidar_to_camera_transform_path)
         if path is None:
             reference_transform = self._load_reference_sensor_transform(dataset_root)
@@ -400,6 +430,21 @@ class ColmapDataParser(ADDataParser):
                 value = origin + idx * float(self.config.synthetic_time_interval)
             aligned.append(float(value) - origin)
         return aligned
+
+    def _fill_missing_lidar_times(self, raw_times: List[Optional[float]], start_value: float) -> List[float]:
+        times: List[float] = []
+        last = None
+        for idx, raw_time in enumerate(raw_times):
+            if raw_time is None:
+                if last is None:
+                    value = start_value + idx * float(self.config.synthetic_time_interval)
+                else:
+                    value = last + float(self.config.synthetic_time_interval)
+            else:
+                value = float(raw_time)
+            times.append(float(value))
+            last = float(value)
+        return times
 
     def _parse_pcd_xyz(self, path: Path) -> np.ndarray:
         with open(path, "rb") as file:
@@ -462,35 +507,101 @@ class ColmapDataParser(ADDataParser):
             count = min(len(raw_times), len(frame_paths))
             raw_times = raw_times[:count]
             frame_paths = frame_paths[:count]
-        aligned_times = self._align_lidar_times(raw_times)
+        camera_abs_times = getattr(self, "_camera_absolute_times", None)
+        camera_rel_times = getattr(self, "_camera_relative_times", None)
+        camera_to_worlds = getattr(self, "_camera_to_world_tensor", None)
+
+        # Fallback to the original interpolation-based alignment if camera timing info is missing
+        if not camera_abs_times or camera_rel_times is None or camera_to_worlds is None:
+            aligned_times = self._align_lidar_times(raw_times)
+            lidar_to_camera = getattr(self, "_lidar_to_camera_pose", None)
+            if lidar_to_camera is None:
+                lidar_to_camera = self._load_lidar_to_camera_transform(dataset_root)
+                self._lidar_to_camera_pose = lidar_to_camera
+            lidar_to_worlds: List[torch.Tensor] = []
+            for time_value in aligned_times:
+                pose = self._lookup_reference_pose(time_value)
+                if pose is None:
+                    if lidar_to_worlds:
+                        pose = lidar_to_worlds[-1]
+                    else:
+                        pose = torch.eye(3, 4)
+                l2w = torch.eye(4)
+                l2w[:3, :4] = pose if pose.shape == (3, 4) else pose[:3, :4]
+                l2w = torch.matmul(l2w, lidar_to_camera)
+                lidar_to_worlds.append(l2w[:3, :4].clone())
+            lidar_to_world_tensor = torch.stack([mat.float() for mat in lidar_to_worlds], dim=0)
+            times_tensor = torch.tensor(aligned_times, dtype=torch.float64).unsqueeze(-1)
+            zero_velocity = torch.zeros((len(aligned_times), 3), dtype=torch.float32)
+            metadata = {
+                "sensor_idxs": torch.zeros((len(aligned_times), 1), dtype=torch.int32),
+                "linear_velocities_local": zero_velocity,
+                "angular_velocities_local": zero_velocity,
+                "timestamps": times_tensor,
+            }
+            lidars = Lidars(lidar_to_worlds=lidar_to_world_tensor, times=times_tensor, metadata=metadata)
+            self._dynamic_lidar = True
+            return lidars, frame_paths
+
+        # Build absolute lidar times, filling any missing values with synthetic spacing
+        start_value = raw_times[0] if raw_times and raw_times[0] is not None else float(camera_abs_times[0])
+        lidar_abs_times = self._fill_missing_lidar_times(raw_times, start_value)
+
+        cam_times_tensor = torch.tensor(camera_abs_times, dtype=torch.float64)
+        lidar_times_tensor = torch.tensor(lidar_abs_times, dtype=torch.float64)
+        time_diffs = torch.abs(cam_times_tensor[:, None] - lidar_times_tensor[None, :])
+        nearest_lidar_idxs = torch.argmin(time_diffs, dim=1)
+
         lidar_to_camera = getattr(self, "_lidar_to_camera_pose", None)
         if lidar_to_camera is None:
             lidar_to_camera = self._load_lidar_to_camera_transform(dataset_root)
             self._lidar_to_camera_pose = lidar_to_camera
-        lidar_to_worlds: List[torch.Tensor] = []
-        for time_value in aligned_times:
-            pose = self._lookup_reference_pose(time_value)
-            if pose is None:
-                if lidar_to_worlds:
-                    pose = lidar_to_worlds[-1]
-                else:
-                    pose = torch.eye(3, 4)
-            l2w = torch.eye(4)
-            l2w[:3, :4] = pose if pose.shape == (3, 4) else pose[:3, :4]
+        lidar_to_camera = lidar_to_camera.float()
+
+        used_lidar_indices = sorted(set(idx for idx in nearest_lidar_idxs.tolist() if 0 <= idx < len(frame_paths)))
+        matched_paths: List[Path] = []
+        matched_lidar_to_world: List[torch.Tensor] = []
+        matched_times: List[float] = []
+        deltas: List[float] = []
+
+        for lidar_idx in used_lidar_indices:
+            # pick the camera that is closest in time to this lidar frame
+            cam_idx = int(torch.argmin(time_diffs[:, lidar_idx]).item())
+            cam_pose = camera_to_worlds[cam_idx]
+            l2w = torch.eye(4, dtype=torch.float32)
+            l2w[:3, :4] = cam_pose if cam_pose.shape == (3, 4) else cam_pose[:3, :4]
             l2w = torch.matmul(l2w, lidar_to_camera)
-            lidar_to_worlds.append(l2w[:3, :4].clone())
-        lidar_to_world_tensor = torch.stack([mat.float() for mat in lidar_to_worlds], dim=0)
-        times_tensor = torch.tensor(aligned_times, dtype=torch.float64).unsqueeze(-1)
-        zero_velocity = torch.zeros((len(aligned_times), 3), dtype=torch.float32)
+            matched_lidar_to_world.append(l2w[:3, :4].clone())
+            matched_paths.append(frame_paths[lidar_idx])
+            matched_times.append(float(camera_rel_times[cam_idx]))
+            deltas.append(float(time_diffs[cam_idx, lidar_idx]))
+
+        if not matched_paths:
+            raise RuntimeError("Failed to match any LiDAR frames to camera timestamps.")
+
+        if len(used_lidar_indices) < len(frame_paths):
+            CONSOLE.log(
+                f"[yellow]Using {len(matched_paths)} LiDAR frames matched to cameras; "
+                f"dropped {len(frame_paths) - len(used_lidar_indices)} unmatched frames based on timestamps."
+            )
+        min_match, max_match = used_lidar_indices[0], used_lidar_indices[-1]
+        CONSOLE.log(
+            f"[green]Timestamp matching: first camera uses LiDAR frame {min_match}, last uses {max_match}; "
+            f"mean Δt={np.mean(deltas):.4f}s"
+        )
+
+        lidar_to_world_tensor = torch.stack([mat.float() for mat in matched_lidar_to_world], dim=0)
+        times_tensor = torch.tensor(matched_times, dtype=torch.float64).unsqueeze(-1)
+        zero_velocity = torch.zeros((len(matched_paths), 3), dtype=torch.float32)
         metadata = {
-            "sensor_idxs": torch.zeros((len(aligned_times), 1), dtype=torch.int32),
+            "sensor_idxs": torch.zeros((len(matched_paths), 1), dtype=torch.int32),
             "linear_velocities_local": zero_velocity,
             "angular_velocities_local": zero_velocity,
             "timestamps": times_tensor,
         }
         lidars = Lidars(lidar_to_worlds=lidar_to_world_tensor, times=times_tensor, metadata=metadata)
         self._dynamic_lidar = True
-        return lidars, frame_paths
+        return lidars, matched_paths
 
     def _load_pcd_tensor(self, path: Path) -> torch.Tensor:
         xyz = self._parse_pcd_xyz(path).astype(np.float32)
@@ -612,6 +723,7 @@ class ColmapDataParser(ADDataParser):
         camera_to_world_tensor = torch.stack(poses, dim=0)
         times = self._finalize_camera_times(raw_timestamps, frame_sensor_names, camera_to_world_tensor)
         self._camera_positions_world = camera_to_world_tensor[:, :3, 3].cpu().numpy()
+        self._camera_to_world_tensor = camera_to_world_tensor
         cameras = Cameras(
             camera_to_worlds=camera_to_world_tensor,
             fx=torch.tensor(fx_list, dtype=torch.float32),
@@ -678,13 +790,13 @@ class ColmapDataParser(ADDataParser):
         if not isinstance(rot, np.ndarray) or rot.shape != (3, 3):
             rot = np.asarray(rot, dtype=np.float64).reshape(3, 3)
         tvec = np.asarray(image.tvec, dtype=np.float64)
-        w2c = np.eye(4, dtype=np.float64)
-        w2c[:3, :3] = rot
-        w2c[:3, 3] = tvec
-        c2w = np.linalg.inv(w2c)
+        W2C = np.eye(4, dtype=np.float64)
+        W2C[:3, :3] = rot
+        W2C[:3, 3] = tvec
+        C2W = np.linalg.inv(W2C)
         if self.config.apply_opencv_to_nerfstudio:
-            c2w[:3, :3] = c2w[:3, :3] @ OPENCV_TO_NERFSTUDIO
-        return c2w
+            C2W[:3, :3] = C2W[:3, :3] @ OPENCV_TO_NERFSTUDIO
+        return C2W
 
     def _resolve_image_file(self, dataset_root: Path, images_root: Path, rel_name: Path) -> Path:
         """Resolve an image filename that may already encode part of the directory structure."""

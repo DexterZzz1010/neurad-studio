@@ -520,7 +520,7 @@ method_configs["colmap-splatgut"].pipeline.datamanager = FullImageLidarDatamanag
         train_split_fraction=0.9,
         colmap_model_path="colmap",
         images_path="colmap/images_rectified",
-        masks_path="colmap/masks_rectified",
+        # masks_path="colmap/masks_rectified",
         use_binary_model=False,
         ignore_missing_images=True,
         synthetic_time_interval=0.01,
@@ -530,6 +530,13 @@ method_configs["colmap-splatgut"].pipeline.datamanager = FullImageLidarDatamanag
         reference_sensor_name="FC",
         lidar_frames_path="../o3d_frames",
         lidar_timestamps_path="../o3d_frames/timestamps.npy",
+        # Vehicle-frame extrinsics; l2c will be computed as inv(T_c2v) @ T_l2v
+        vehicle_lidar_quaternion=(0.6960765295335133, -0.00244159368565038, 0.0001385997267153349, -0.7179634283464374),
+        vehicle_lidar_translation=(1.116397595777498, 0.002015994268530099, 1.74425940541538),
+
+        vehicle_camera_quaternion=(-0.4895178353134785, 0.5106169040063513, -0.4907313715598111, 0.5087488449323524),
+        vehicle_camera_translation=(2.009330573500526, -0.008145578463557433, 1.151854914801598),
+        # Fallback l2c if vehicle-frame not provided:
         lidar_quaternion=(
             0.6960765295335133,
             -0.00244159368565038,
@@ -551,11 +558,11 @@ method_configs["colmap-splatgut"].optimizers = {
         ),
     },
     "features_dc": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025/40, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
         "scheduler": None,
     },
     "features_rest": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025/40, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
         "scheduler": None,
     },
     "opacities": {
