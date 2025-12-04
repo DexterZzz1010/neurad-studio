@@ -29,7 +29,7 @@ def get_image_mask_tensor_from_path(filepath: Path, scale_factor: float = 1.0) -
     """
     Utility function to read a mask image from the given path and return a boolean tensor
     """
-    pil_mask = Image.open(filepath)
+    pil_mask = Image.open(filepath).convert("L")  # force single channel
     if scale_factor != 1.0:
         width, height = pil_mask.size
         newsize = (int(width * scale_factor), int(height * scale_factor))

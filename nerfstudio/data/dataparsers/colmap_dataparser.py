@@ -709,10 +709,10 @@ class ColmapDataParser(ADDataParser):
         frame_sensor_names: List[str] = []
         raw_timestamps: List[Optional[float]] = []
         mask_root = self._resolve_optional_path(dataset_root, self.config.masks_path) if self.config.masks_path else None
-        mask_filenames: List[Path] = []
-        missing_masks = False
+        mask_filenames: List[Optional[Path]] = []
+        images_root_resolved = images_root.resolve()
 
-        for image in cam_extrinsics:
+        for idx, image in enumerate(cam_extrinsics):
             if camera_id_filter and image.camera_id not in camera_id_filter:
                 continue
             if self.config.image_name_filter and not fnmatch(image.name, self.config.image_name_filter):
@@ -756,18 +756,29 @@ class ColmapDataParser(ADDataParser):
             sensor_idx = _sensor_idx(image.camera_id)
             sensor_idxs.append(sensor_idx)
             rel_name = Path(image.name)
-            sensor_prefix = rel_name.parts[0] if len(rel_name.parts) > 1 else rel_name.stem.split("_")[0]
-            frame_sensor_names.append(sensor_prefix)
+            current_sensor_prefix = rel_name.parts[0] if len(rel_name.parts) > 1 else rel_name.stem.split("_")[0]
+            frame_sensor_names.append(current_sensor_prefix)
             timestamp_key = rel_name.as_posix()
             raw_time = image_timestamp_table.get(timestamp_key)
             if raw_time is None:
                 raw_time = image_timestamp_table.get(rel_name.name)
             raw_timestamps.append(raw_time)
             if mask_root is not None:
-                mask_path = self._resolve_mask_file(dataset_root, mask_root, rel_name)
-                if mask_path is None or not mask_path.exists():
-                    missing_masks = True
-                mask_filenames.append(mask_path if mask_path is not None else Path())
+                try:
+                    img_rel_to_images = img_path.resolve().relative_to(images_root_resolved)
+                except Exception:
+                    img_rel_to_images = rel_name
+                mask_rel_name = img_rel_to_images
+                if len(mask_rel_name.parts) == 1 and current_sensor_prefix:
+                    mask_rel_name = Path(current_sensor_prefix) / mask_rel_name.name
+                mask_path = self._resolve_mask_file(dataset_root, mask_root, mask_rel_name)
+                if idx < 10 or mask_path is None:
+                    rel_log = img_rel_to_images if isinstance(img_rel_to_images, Path) else Path(str(img_rel_to_images))
+                    CONSOLE.log(
+                        f"[cyan]Mask match img_idx={idx}: {rel_log} (sensor={current_sensor_prefix}) -> "
+                        f"{mask_path.relative_to(dataset_root) if mask_path else 'NOT FOUND'}"
+                    )
+                mask_filenames.append(mask_path if mask_path is not None else None)
 
         if not poses:
             raise RuntimeError("No COLMAP frames were loaded. Check filters and paths.")
@@ -796,17 +807,28 @@ class ColmapDataParser(ADDataParser):
             },
         )
         
-        if mask_root is not None and not missing_masks and len(mask_filenames) == len(image_filenames):
-            self._mask_filenames = mask_filenames
-            CONSOLE.log(f"[green]Loaded {len(mask_filenames)} masks from {mask_root}")
-        else:
-            self._mask_filenames = None
-            if mask_root is not None:
+        if mask_root is not None and len(mask_filenames) == len(image_filenames):
+            exists_count = len([m for m in mask_filenames if m is not None and m.is_file()])
+            if exists_count == len(image_filenames):
+                # All masks exist and are files; cast away Nones
+                self._mask_filenames = [m for m in mask_filenames if m is not None]
+                CONSOLE.log(f"[green]Loaded {len(self._mask_filenames)} masks from {mask_root}")
+                # Log a few examples to verify camera-folder alignment (mirrors 3dgrut logic)
+                sample_log = []
+                for img_path, m_path in zip(image_filenames[:3], self._mask_filenames[:3]):
+                    img_rel = img_path.relative_to(dataset_root) if img_path.is_absolute() else img_path
+                    mask_rel = m_path.relative_to(dataset_root) if m_path.is_absolute() else m_path
+                    sample_log.append(f"{img_rel} -> {mask_rel}")
+                if sample_log:
+                    CONSOLE.log("[green]Mask mapping samples: " + "; ".join(sample_log))
+            else:
+                self._mask_filenames = None
                 CONSOLE.log(
                     f"[yellow]Masks requested at {mask_root} but not all were found "
-                    f"(matched {len([m for m in mask_filenames if m and m.exists()])}/{len(image_filenames)}); "
-                    "continuing without masks."
+                    f"(matched {exists_count}/{len(image_filenames)}); continuing without masks."
                 )
+        else:
+            self._mask_filenames = None
         return cameras, image_filenames
 
     def _get_lidars(self) -> Tuple[Lidars, List[Path]]:
@@ -872,22 +894,22 @@ class ColmapDataParser(ADDataParser):
         return images_root / rel_name
 
     def _resolve_mask_file(self, dataset_root: Path, masks_root: Path, rel_name: Path) -> Optional[Path]:
-        """Resolve a mask filename mirroring the image path layout."""
+        """Strictly mirror image path under masks_root: same dirs, same stem, prefer .jpg.png."""
         if rel_name.is_absolute():
             rel_name = rel_name.relative_to(rel_name.anchor)
-        candidates = [
-            dataset_root / rel_name,
-            masks_root / rel_name,
-            rel_name,
+        stem_with_dir = rel_name.with_suffix("")  # drop current suffix for consistency
+        candidates: List[Path] = [
+            masks_root / stem_with_dir.with_suffix(".jpg.png"),  # strict: original.jpg -> original.jpg.png
+            masks_root / stem_with_dir.with_suffix(".png"),
+            masks_root / stem_with_dir.with_suffix(".jpg"),
         ]
-        seen = set()
         for candidate in candidates:
-            key = candidate.resolve().as_posix() if candidate.exists() else candidate.as_posix()
-            if key in seen:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
                 continue
-            seen.add(key)
-            if candidate.exists():
-                return candidate
+            if resolved.exists() and resolved.is_file() and str(resolved).startswith(str(masks_root.resolve())):
+                return resolved
         return None
 
     def _load_point_cloud(self, dataset_root: Path, model_root: Path) -> Tensor:

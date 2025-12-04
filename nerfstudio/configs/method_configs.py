@@ -461,15 +461,15 @@ method_configs["splatgut"] = TrainerConfig(
             ),
         },
         "features_dc": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025/20, eps=1e-15),
+            "optimizer": AdamOptimizerConfig(lr=0.0025/5, eps=1e-15),
             "scheduler": None,
         },
         "features_rest": {
-            "optimizer": AdamOptimizerConfig(lr=0.0025/20, eps=1e-15),
+            "optimizer": AdamOptimizerConfig(lr=0.0025/5, eps=1e-15),
             "scheduler": None,
         },
         "opacities": {
-            "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
             "scheduler": None,
         },
         "scales": {
@@ -550,11 +550,11 @@ method_configs["colmap-splatgut"].optimizers = {
         ),
     },
     "features_dc": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025/20, eps=1e-15),
         "scheduler": None,
     },
     "features_rest": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025/20 , eps=1e-15),
         "scheduler": None,
     },
     "opacities": {

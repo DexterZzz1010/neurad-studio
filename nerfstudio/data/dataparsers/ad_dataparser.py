@@ -176,13 +176,14 @@ class ADDataParser(DataParser):
     def _generate_dataparser_outputs(self, split="train"):
         # Load data (this is implemented in the dataset-specific subclass)
         cameras, img_filenames = self._get_cameras() if self.config.cameras else (_empty_cameras(), [])
+        mask_filenames = getattr(self, "_mask_filenames", None)
         lidars, pc_filenames = self._get_lidars() if self.config.lidars else (_empty_lidars(), [])
         radars = self._get_radars() if self.config.radars else None
         assert radars is None, "Radars not supported yet"
         trajectories = self._get_actor_trajectories() if self.config.load_cuboids else []
         # use dataset fraction to filter data
-        cameras, img_filenames, lidars, pc_filenames, trajectories = self._filter_based_on_time(
-            cameras, img_filenames, lidars, pc_filenames, trajectories
+        cameras, img_filenames, lidars, pc_filenames, trajectories, mask_filenames = self._filter_based_on_time(
+            cameras, img_filenames, lidars, pc_filenames, trajectories, mask_filenames
         )
         # read all the point clouds
         point_clouds = self._read_lidars(lidars, pc_filenames)
@@ -205,6 +206,8 @@ class ADDataParser(DataParser):
         split = 0 if split == "train" else 1
         cam_idxs = self._get_train_eval_indices(cameras)[split]
         cameras, img_filenames = cameras[cam_idxs], [img_filenames[i] for i in cam_idxs]
+        if mask_filenames is not None:
+            mask_filenames = [mask_filenames[i] for i in cam_idxs]
         lidar_idxs = self._get_train_eval_indices(lidars)[split]
         lidars, point_clouds = lidars[lidar_idxs], [point_clouds[i] for i in lidar_idxs]
 
@@ -226,7 +229,7 @@ class ADDataParser(DataParser):
             image_filenames=img_filenames,
             cameras=cameras,
             scene_box=scene_box,
-            mask_filenames=getattr(self, "_mask_filenames", None),
+            mask_filenames=mask_filenames,
             dataparser_scale=1.0,  # no scaling
             dataparser_transform=dataparser_transform,
             actor_transform=self.actor_transform,
@@ -273,10 +276,11 @@ class ADDataParser(DataParser):
         lidars: Lidars,
         pc_filenames: List[Path],
         trajectories: List[Dict],
-    ) -> Tuple[Cameras, List[Path], Lidars, List[Path], List[Dict]]:
+        mask_filenames: Optional[List[Optional[Path]]] = None,
+    ) -> Tuple[Cameras, List[Path], Lidars, List[Path], List[Dict], Optional[List[Optional[Path]]]]:
         # Remove the data that is outside the dataset start/end fraction
         if self.config.dataset_start_fraction == 0.0 and self.config.dataset_end_fraction == 1.0:
-            return cameras, img_filenames, lidars, pc_filenames, trajectories
+            return cameras, img_filenames, lidars, pc_filenames, trajectories, mask_filenames
 
         times = torch.cat([cameras.times, lidars.times], dim=0)
         end_time = times.max().item()
@@ -285,7 +289,10 @@ class ADDataParser(DataParser):
         end_time = start_time + duration * self.config.dataset_end_fraction
         start_time += duration * self.config.dataset_start_fraction
 
+        cam_time_mask = (cameras.times >= start_time) & (cameras.times <= end_time)
         cameras, img_filenames = _filter_sensordata_on_time(cameras, img_filenames, start_time, end_time)
+        if mask_filenames is not None and len(mask_filenames) == len(cam_time_mask):
+            mask_filenames = [mask_filenames[i] for i, keep in enumerate(cam_time_mask) if keep]
         lidars, pc_filenames = _filter_sensordata_on_time(lidars, pc_filenames, start_time, end_time)
         assert len(cameras) or len(lidars), "No cameras or lidars in the dataset"
         # filter the trajectories that are not in the sequence at all
@@ -295,7 +302,7 @@ class ADDataParser(DataParser):
             if (traj["timestamps"] >= start_time).any() and (traj["timestamps"] <= end_time).any()
         ]
 
-        return cameras, img_filenames, lidars, pc_filenames, trajectories
+        return cameras, img_filenames, lidars, pc_filenames, trajectories, mask_filenames
 
     def _adjust_times(
         self, cameras: Cameras, lidars: Lidars, point_clouds: List[Tensor], trajectories: List[Dict]
