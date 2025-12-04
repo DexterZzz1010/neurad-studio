@@ -941,11 +941,21 @@ class ColmapDataParser(ADDataParser):
             intensities = (colors.mean(axis=1, keepdims=True) / 255.0).astype(np.float32)
             times = np.zeros((positions.shape[0], 1), dtype=np.float32)
             tensor = torch.from_numpy(np.concatenate([positions.astype(np.float32), intensities, times], axis=1))
+            finite_mask = torch.isfinite(tensor).all(dim=1)
         CONSOLE.log(
             f"[green]Seed cloud ready: {tensor.shape[0]} points "
             f"({'fallback' if used_fallback else 'COLMAP'}) from '{points_path.name}'"
         )
         self._cached_point_cloud_tensor = tensor
+        # Preserve sanitized COLMAP seeds for SFM-based initialization.
+        self._points3d_positions = tensor[:, :3].clone()
+        colors_tensor = torch.from_numpy(colors.astype(np.float32))
+        if colors_tensor.shape[0] == finite_mask.shape[0]:
+            colors_tensor = colors_tensor[finite_mask]
+        elif colors_tensor.shape[0] != tensor.shape[0]:
+            colors_tensor = colors_tensor[: tensor.shape[0]]
+        self._points3d_colors = colors_tensor
+        self._points3d_times = torch.zeros((self._points3d_positions.shape[0], 1), dtype=torch.float32)
         return tensor
 
     def _resolve_point_cloud_path(self, dataset_root: Path, model_root: Path) -> Path:
@@ -1037,3 +1047,38 @@ class ColmapDataParser(ADDataParser):
         aabb_max[2] = float(self.config.scene_box_height[1])
         aabb = torch.stack([aabb_min, aabb_max], dim=0)
         return SceneBox(aabb=aabb)
+
+    def _generate_dataparser_outputs(self, split="train"):
+        """Augment base outputs with COLMAP SFM seeds while still loading LiDAR."""
+        outputs = super()._generate_dataparser_outputs(split=split)
+
+        points = getattr(self, "_points3d_positions", None)
+        colors = getattr(self, "_points3d_colors", None)
+        if points is not None and colors is not None:
+            points = points.clone()
+            colors = colors.clone()
+            if colors.shape[0] != points.shape[0]:
+                colors = colors[: points.shape[0]]
+            times = getattr(self, "_points3d_times", None)
+            if times is None or times.shape[0] != points.shape[0]:
+                times = torch.zeros((points.shape[0], 1), dtype=points.dtype)
+
+            transform = outputs.dataparser_transform
+            if transform is not None and transform.numel():
+                transform = transform.to(points.device)
+                if transform.shape == (3, 4):
+                    transform = torch.cat(
+                        [
+                            transform,
+                            torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=transform.device, dtype=transform.dtype),
+                        ],
+                        dim=0,
+                    )
+                if transform.shape == (4, 4):
+                    points_h = torch.cat([points, torch.ones_like(points[:, :1])], dim=-1)
+                    points = (transform @ points_h.T).T[:, :3]
+
+            outputs.metadata["points3D_xyz"] = points
+            outputs.metadata["points3D_rgb"] = colors
+            outputs.metadata["points3D_times"] = times.to(points.device)
+        return outputs

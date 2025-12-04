@@ -102,7 +102,10 @@ class SplatADPipeline(VanillaPipeline):
         ):
             pts = self.datamanager.train_dataparser_outputs.metadata["points3D_xyz"]
             pts_rgb = self.datamanager.train_dataparser_outputs.metadata["points3D_rgb"]
-            seed_pts = (pts, pts_rgb)
+            pts_times = self.datamanager.train_dataparser_outputs.metadata.get("points3D_times")
+            if pts_times is None or pts_times.shape[0] != pts.shape[0]:
+                pts_times = torch.zeros((pts.shape[0], 1), dtype=pts.dtype, device=pts.device)
+            seed_pts = (pts, pts_rgb, pts_times)
         elif (
             hasattr(self.datamanager, "train_dataparser_outputs")
             and "point_clouds" in self.datamanager.train_dataparser_outputs.metadata
