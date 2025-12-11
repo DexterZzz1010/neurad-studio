@@ -1378,23 +1378,47 @@ class SplatADModel(ADModel):
                 # raise user warning
                 warnings.warn("GT image and predicted image have different shapes. Cropping GT image to match.")
 
-            # Set masked part of both ground-truth and rendered image to black.
-            # This is a little bit sketchy for the SSIM loss.
             if "mask" in batch:
                 # batch["mask"] : [H, W, 1]
-                mask = self._downscale_if_required(batch["mask"])
-                mask = mask.to(self.device)
+                mask = self._downscale_if_required(batch["mask"]).to(self.device)
                 assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
-                gt_img = gt_img * mask
-                pred_img = pred_img * mask
 
-            Ll1 = torch.abs(gt_img - pred_img).mean()
-            simloss = (
-                1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
-                if self.config.ssim_lambda > 0
-                else 0
-            )
-            loss_dict["main_loss"] = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
+                # L1：仅有效区域，加权归一化，避免 mask 面积变化带来波动
+                weight = mask.float()  # [H,W,1]
+                valid_sum = weight.sum() * 3.0  # 三个通道
+                if valid_sum > 0:
+                    Ll1 = (torch.abs(gt_img - pred_img) * weight).sum() / valid_sum
+
+                    # SSIM：仅在有效区域，先置零无效区域，若有效区域过小则跳过
+                    if self.config.ssim_lambda > 0 and valid_sum > 0:
+                        gt_img_ssim = gt_img * weight
+                        pred_img_ssim = pred_img * weight
+                        simloss = (
+                            1
+                            - self.ssim(
+                                gt_img_ssim.permute(2, 0, 1)[None, ...],
+                                pred_img_ssim.permute(2, 0, 1)[None, ...],
+                            )
+                        )
+                    else:
+                        simloss = torch.zeros(1, device=self.device)
+
+                    loss_dict["main_loss"] = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
+                else:
+                    # 空 mask：跳过 RGB 损失
+                    loss_dict["main_loss"] = torch.zeros(1, device=self.device)
+            else:
+                Ll1 = torch.abs(gt_img - pred_img).mean()
+                simloss = (
+                    1
+                    - self.ssim(
+                        gt_img.permute(2, 0, 1)[None, ...],
+                        pred_img.permute(2, 0, 1)[None, ...],
+                    )
+                    if self.config.ssim_lambda > 0
+                    else 0
+                )
+                loss_dict["main_loss"] = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
 
         if self.config.mcmc_scale_reg_lambda and isinstance(self.strategy, ADMCMCStrategy):
             mcmc_scale_reg = torch.abs(torch.exp(self.scales).mean()) * self.config.mcmc_scale_reg_lambda

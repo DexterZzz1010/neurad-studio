@@ -550,19 +550,19 @@ method_configs["colmap-splatgut"].optimizers = {
         ),
     },
     "features_dc": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025/20, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
         "scheduler": None,
     },
     "features_rest": {
-        "optimizer": AdamOptimizerConfig(lr=0.0025/20 , eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.0025 , eps=1e-15),
         "scheduler": None,
     },
     "opacities": {
-        "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
         "scheduler": None,
     },
     "scales": {
-        "optimizer": AdamOptimizerConfig(lr=0.002, eps=1e-15),
+        "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
         "scheduler": None,
     },
     "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
