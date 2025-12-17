@@ -40,6 +40,7 @@ except ImportError:
 import numpy as np
 import torch
 from rich.progress import track
+from tqdm import tqdm
 from torch.nn import Parameter
 from typing_extensions import assert_never
 
@@ -318,6 +319,19 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
 
     def setup_eval(self):
         """Sets up the data loader for evaluation"""
+        # Force caching with a visible progress bar to avoid silent long waits
+        if len(self.train_dataset) > 0:
+            for _ in tqdm(range(len(self.train_dataset)), desc="Caching train images"):
+                _ = self.cached_train
+        if len(self.eval_dataset) > 0:
+            for _ in tqdm(range(len(self.eval_dataset)), desc="Caching eval images"):
+                _ = self.cached_eval
+        if hasattr(self, "train_lidar_dataset") and len(self.train_lidar_dataset) > 0:
+            for _ in tqdm(range(len(self.train_lidar_dataset)), desc="Caching train lidars"):
+                _ = self.cached_lidar_train
+        if hasattr(self, "eval_lidar_dataset") and len(self.eval_lidar_dataset) > 0:
+            for _ in tqdm(range(len(self.eval_lidar_dataset)), desc="Caching eval lidars"):
+                _ = self.cached_lidar_eval
 
     @property
     def fixed_indices_eval_dataloader(self) -> List[Tuple[Cameras, Dict]]:
