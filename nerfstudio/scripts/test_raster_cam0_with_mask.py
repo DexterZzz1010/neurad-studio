@@ -4,6 +4,8 @@
 通过monkey patch获取get_outputs_for_camera内部的rasterization info
 """
 import argparse
+import os
+import re
 import time
 from pathlib import Path
 from typing import Dict, Set, Optional, Tuple
@@ -120,6 +122,46 @@ def _debug_cuda(tag: str, sync: bool):
         print(f"[cuda] {tag}: used={used/1e9:.2f}GB free={free/1e9:.2f}GB total={total/1e9:.2f}GB")
 
 
+def extract_real_frame_idx(
+    meta: dict, fallback: int, image_filename: str = None, image_name: str = None
+) -> int:
+    """Extract real frame index from metadata or filenames."""
+    for k in ["frame_num", "frame_idx", "frame_id", "image_idx", "timestamp_idx"]:
+        if k in meta:
+            v = meta[k]
+            if isinstance(v, torch.Tensor):
+                return int(v.item())
+            return int(v)
+
+    if "filepath" in meta:
+        filepath = meta["filepath"]
+        if isinstance(filepath, (list, tuple)):
+            filepath = filepath[0]
+        match = re.search(r'[/\\]?(\d+)\.png', str(filepath))
+        if match:
+            return int(match.group(1))
+
+    if "image_name" in meta:
+        name = meta["image_name"]
+        match = re.search(r"(\d+)", str(name))
+        if match:
+            return int(match.group(1))
+
+    if image_filename:
+        stem = Path(str(image_filename)).stem
+        match = re.search(r"(\d+)", stem)
+        if match:
+            return int(match.group(1))
+
+    if image_name:
+        stem = Path(str(image_name)).name
+        match = re.search(r"(\d+)", stem)
+        if match:
+            return int(match.group(1))
+
+    return fallback
+
+
 # ============================================================================
 # Masking相关函数
 # ============================================================================
@@ -146,6 +188,195 @@ def _tiles_from_mask(mask: torch.Tensor, tile_size: int, tile_width: int) -> tor
     tile_hit = m.any(dim=3).any(dim=1)
     tiles = tile_hit.flatten().nonzero(as_tuple=False).squeeze(1)
     return tiles
+
+
+
+# ============================================================================
+# 在 Masking相关函数 部分添加
+# ============================================================================
+
+def _visualize_voting_result(
+    frame_gauss_set: Set[int],
+    info: dict,
+    mask: torch.Tensor,
+    outputs: dict,
+    save_path: Path,
+    frame_idx: int,
+    device: torch.device,
+):
+    """
+    可视化投票结果：绘制选中高斯的2D投影和mask边界
+    """
+    try:
+        import cv2  # type: ignore
+        _has_cv2 = True
+    except Exception:
+        cv2 = None
+        _has_cv2 = False
+    
+    if len(frame_gauss_set) == 0:
+        print(f"  [viz] Skipping visualization - no gaussians voted")
+        return
+    
+    # 获取渲染图
+    if "rgb" in outputs:
+        render_img = outputs["rgb"]
+    elif "image" in outputs:
+        render_img = outputs["image"]
+    elif "comp_rgb" in outputs:
+        render_img = outputs["comp_rgb"]
+    else:
+        print(f"  [viz] No RGB output available")
+        return
+
+    # Detach to avoid autograd tracking when converting to numpy
+    render_img = render_img.detach()
+    
+    # 转numpy [H, W, 3]
+    if render_img.dim() == 4:  # [1, H, W, 3]
+        render_np = render_img[0].cpu().numpy()
+    elif render_img.dim() == 3:
+        if render_img.shape[0] == 3:  # [3, H, W]
+            render_np = render_img.permute(1, 2, 0).cpu().numpy()
+        else:  # [H, W, 3]
+            render_np = render_img.cpu().numpy()
+    else:
+        print(f"  [viz] Unexpected render shape: {render_img.shape}")
+        return
+    
+    render_np = (render_np * 255).clip(0, 255).astype(np.uint8)
+    H, W = render_np.shape[:2]
+    
+    # 创建可视化画布
+    vis = np.array(render_np, dtype=np.uint8, copy=True, order="C")
+    if vis.ndim == 2:
+        vis = np.repeat(vis[..., None], 3, axis=2)
+    elif vis.ndim == 3 and vis.shape[2] > 3:
+        vis = vis[..., :3]
+    
+    # 1. 绘制投票的高斯（绿点）
+    voted_ids = torch.tensor(list(frame_gauss_set), dtype=torch.long, device=device)
+    
+    if "means2d" not in info:
+        print(f"  [viz] No means2d in info")
+        return
+    
+    means2d = info["means2d"]
+    means2d = means2d.detach()
+    if means2d.ndim == 3:
+        means2d = means2d[0]  # [N, 2]
+    
+    voted_means2d = means2d[voted_ids].cpu().numpy()
+    
+    # 随机采样（避免图像太密）
+    max_points = 3000
+    if len(voted_means2d) > max_points:
+        sample_idx = np.random.choice(len(voted_means2d), max_points, replace=False)
+        sampled_means2d = voted_means2d[sample_idx]
+    else:
+        sampled_means2d = voted_means2d
+    
+    mask_np = mask.detach().cpu().numpy().astype(np.uint8)
+
+    def _draw_with_pil() -> None:
+        from PIL import ImageDraw, ImageFilter
+
+        vis_img = Image.fromarray(vis)
+        draw = ImageDraw.Draw(vis_img)
+
+        for pt in sampled_means2d:
+            x, y = int(pt[0]), int(pt[1])
+            if 0 <= x < W and 0 <= y < H:
+                draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=(0, 255, 0))
+
+        mask_img = Image.fromarray((mask_np * 255).astype(np.uint8), mode="L")
+        edges = mask_img.filter(ImageFilter.FIND_EDGES).filter(ImageFilter.MaxFilter(7))
+        edge = np.asarray(edges) > 0
+
+        vis_arr = np.asarray(vis_img).copy()
+        vis_arr[edge] = (255, 0, 0)
+        vis_img = Image.fromarray(vis_arr)
+
+        draw = ImageDraw.Draw(vis_img)
+        info_text = [
+            f"Frame {frame_idx}",
+            f"Voted: {len(frame_gauss_set)} gaussians",
+            f"Shown: {len(sampled_means2d)} points",
+            f"Mask: {mask.sum().item():.0f} pixels",
+        ]
+        y_offset = 10
+        for line in info_text:
+            draw.text((10, y_offset), line, fill=(255, 255, 0))
+            y_offset += 18
+
+        vis_img.save(save_path)
+
+    if _has_cv2:
+        try:
+            for pt in sampled_means2d:
+                x, y = int(pt[0]), int(pt[1])
+                if 0 <= x < W and 0 <= y < H:
+                    cv2.circle(vis, (x, y), 2, (0, 255, 0), -1)  # 绿色
+
+            contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(vis, contours, -1, (255, 0, 0), 3)  # 红色粗线
+
+            info_text = [
+                f"Frame {frame_idx}",
+                f"Voted: {len(frame_gauss_set)} gaussians",
+                f"Shown: {len(sampled_means2d)} points",
+                f"Mask: {mask.sum().item():.0f} pixels",
+            ]
+
+            y_offset = 30
+            for line in info_text:
+                cv2.putText(
+                    vis,
+                    line,
+                    (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                y_offset += 30
+
+            legend_y = H - 80
+            cv2.circle(vis, (20, legend_y), 5, (0, 255, 0), -1)
+            cv2.putText(
+                vis,
+                "Voted Gaussians",
+                (35, legend_y + 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.line(vis, (10, legend_y + 30), (30, legend_y + 30), (255, 0, 0), 3)
+            cv2.putText(
+                vis,
+                "Mask Boundary",
+                (35, legend_y + 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            Image.fromarray(vis).save(save_path)
+        except Exception as e:
+            print(f"  [viz] OpenCV draw failed ({type(e).__name__}: {e}); falling back to PIL")
+            _draw_with_pil()
+    else:
+        _draw_with_pil()
+
+    print(f"  [viz] 💾 Saved visualization: {save_path.name}")
+
+
 
 
 def _vote_gaussians_from_mask(
@@ -231,7 +462,7 @@ def main():
     ap.add_argument("config", type=Path)
     ap.add_argument("checkpoint", type=Path)
     
-    ap.add_argument("--split", choices=["eval", "train"], default="eval")
+    ap.add_argument("--split", choices=["eval", "train"], default="train")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--max-frames", type=int, default=10)
     ap.add_argument("--sync-cuda", action="store_true")
@@ -279,10 +510,17 @@ def main():
     # ========== 准备数据 ==========
     if args.split == "eval":
         dataset = pipeline.datamanager.eval_dataset
+        dataparser_outputs = getattr(pipeline.datamanager, "eval_dataparser_outputs", None)
     else:
         dataset = pipeline.datamanager.train_dataset
+        dataparser_outputs = getattr(pipeline.datamanager, "train_dataparser_outputs", None)
+    if dataparser_outputs is None:
+        dataparser_outputs = getattr(dataset, "_dataparser_outputs", None)
     cameras_all = dataset.cameras.to(device)
     print(f"[info] Dataset: {len(cameras_all)} cameras")
+    images_root = None
+    if dataparser_outputs is not None and getattr(dataparser_outputs, "image_filenames", None):
+        images_root = Path(os.path.commonpath(dataparser_outputs.image_filenames))
 
     # 获取高斯总数
     if hasattr(model, "means"):
@@ -358,6 +596,31 @@ def main():
 
         # ========== Masking投票 ==========
         if args.enable_masking:
+            image_filename = None
+            image_name = None
+            if dataparser_outputs is not None and getattr(dataparser_outputs, "image_filenames", None):
+                if idx < len(dataparser_outputs.image_filenames):
+                    image_filename = dataparser_outputs.image_filenames[idx]
+                else:
+                    print(
+                        f"  [masking] image_filenames index out of range: idx={idx}, "
+                        f"len={len(dataparser_outputs.image_filenames)}"
+                    )
+                if images_root is not None:
+                    try:
+                        image_name = str(Path(image_filename).with_suffix("").relative_to(images_root))
+                    except ValueError:
+                        image_name = str(Path(image_filename).with_suffix("").name)
+                else:
+                    image_name = str(Path(image_filename).with_suffix("").name)
+            real_frame_idx = extract_real_frame_idx(
+                meta, cam_frame_counter, image_filename=image_filename, image_name=image_name
+            )
+            if image_name:
+                print(f"  [masking] image_name: {image_name}")
+            else:
+                print("  [masking] image_name: None (no dataparser image_filenames)")
+
             fmt_ctx = {}
             for k, v in meta.items():
                 if isinstance(v, torch.Tensor) and v.numel() == 1:
@@ -365,7 +628,7 @@ def main():
                 elif not isinstance(v, torch.Tensor):
                     fmt_ctx[k] = v
 
-            fmt_ctx["frame_idx"] = cam_frame_counter
+            fmt_ctx["frame_idx"] = real_frame_idx
             fmt_ctx["cam_idx"] = cam_idx
 
             try:
@@ -403,7 +666,7 @@ def main():
 
             print(f"  [masking] ✅ Loaded mask: {mask_path.name}, pixels={mask_pixel_count}")
 
-            # ✅ 投票（使用从get_outputs_for_camera捕获的info）
+            # ✅ 投票
             frame_gauss_set = _vote_gaussians_from_mask(
                 mask=mask,
                 info=info,
@@ -415,9 +678,22 @@ def main():
                 gauss_tensor = torch.tensor(list(frame_gauss_set), dtype=torch.long, device=device)
                 gaussian_frame_count[gauss_tensor] += 1
                 print(f"  [masking] ✅ Voted {len(frame_gauss_set)} gaussians")
+                
+                # # ========== 可视化（前5帧）==========
+                # if args.render_output_root is not None and used < 5:
+                #     args.render_output_root.mkdir(parents=True, exist_ok=True)
+                #     vis_path = args.render_output_root / f"debug_voted_frame{used:04d}.png"
+                #     _visualize_voting_result(
+                #         frame_gauss_set=frame_gauss_set,
+                #         info=info,
+                #         mask=mask,
+                #         outputs=outputs,
+                #         save_path=vis_path,
+                #         frame_idx=used,
+                #         device=device,
+                #     )
             else:
                 print(f"  [masking] ⚠️  No gaussians voted")
-
             cam_frame_counter += 1
 
         used += 1
@@ -466,7 +742,7 @@ def main():
             print(f"\n{'='*60}")
             print(f"[mask] Blackening {num_selected} gaussians...")
             with torch.no_grad():
-                model.features_dc.data[selected] = 0.0
+                model.features_dc.data[selected] = -255.0
                 model.features_rest.data[selected] = 0.0
             print(f"✅ Model updated!")
 
@@ -517,6 +793,8 @@ def main():
                         print(f"  [error] No RGB output in keys: {list(outputs.keys())}")
                         render_count += 1
                         continue
+
+                    render_img = render_img.detach()
                     
                     # ✅ 检查实际渲染分辨率
                     actual_H, actual_W = render_img.shape[-3:-1] if render_img.dim() == 4 else render_img.shape[:2]
@@ -541,6 +819,7 @@ def main():
                         else:
                             raise ValueError(f"Unexpected shape: {render_img.shape}")
                         
+                        img_tensor = img_tensor.detach()
                         img_np = (img_tensor.clamp(0, 1) * 255).byte().cpu().numpy()
                         Image.fromarray(img_np).save(out_path)
                         
